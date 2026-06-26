@@ -93,6 +93,21 @@ def run_valid_day(root, ledger, session, run_id):
                                      latest, raw, True)
 
 
+def mark_ledger_failed(path, failed_session="2026-06-22", run_id="failed-run"):
+    payload = shadow.load_ledger(path)
+    payload["status"] = "SHADOW_FAILED"
+    payload["next_status"] = "MANUAL_REVIEW_REQUIRED"
+    payload.setdefault("failures", []).append({
+        "shadow_day": payload["shadow_days_completed"] + 1,
+        "market_session_date": failed_session,
+        "run_id": run_id,
+        "failures": [{"failed_gate": "data", "failed_field": "primary.date"}],
+    })
+    payload["ledger_sha256"] = shadow._ledger_hash(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
 def day0_report(root):
     report = canonical_report("2026-06-18", "day0")
     path = root / "day0.json"
@@ -203,6 +218,28 @@ class NdxShadowRunTests(unittest.TestCase):
             self.assertFalse(result["shadow_evaluation"]["day_gate_pass"])
             self.assertEqual((shadow.load_ledger(ledger)["status"],shadow.load_ledger(ledger)["shadow_days_completed"]),("SHADOW_FAILED",0))
 
+    def test_35b_historical_failure_does_not_block_future_success(self):
+        with tempfile.TemporaryDirectory() as t:
+            r=Path(t); ledger=r/"ledger.json"; shadow.initialize_ledger(day0_report(r),ledger)
+            mark_ledger_failed(ledger, "2026-06-22", "failed-run")
+            result=run_valid_day(r,ledger,"2026-06-23","run-day-after-failure")
+            final=shadow.load_ledger(ledger)
+            self.assertTrue(result["shadow_evaluation"]["day_gate_pass"])
+            self.assertEqual(final["shadow_days_completed"],1)
+            self.assertEqual(final["days"][0]["market_session_date"],"2026-06-23")
+            self.assertEqual(final["failures"][0]["market_session_date"],"2026-06-22")
+
+    def test_35c_duplicate_failed_session_is_not_recounted(self):
+        with tempfile.TemporaryDirectory() as t:
+            r=Path(t); ledger=r/"ledger.json"; shadow.initialize_ledger(day0_report(r),ledger)
+            mark_ledger_failed(ledger, "2026-06-22", "failed-run")
+            report,latest,raw=runnable_report(r,"2026-06-22","retry-failed-run")
+            result=shadow.run_shadow_session(report,ledger,r/"shadow",dt.date(2026,6,22),dt.datetime(2026,6,22,16,16,tzinfo=NY),latest,raw,True)
+            final=shadow.load_ledger(ledger)
+            self.assertEqual(result["reason"],"DUPLICATE_FAILED_MARKET_SESSION_DATE")
+            self.assertEqual(final["shadow_days_completed"],0)
+            self.assertEqual(len(final["failures"]),1)
+
     def test_36_success_archives_all_required_inputs(self):
         with tempfile.TemporaryDirectory() as t:
             r=Path(t); ledger=r/"ledger.json"; shadow.initialize_ledger(day0_report(r),ledger)
@@ -287,6 +324,12 @@ class NdxShadowRunTests(unittest.TestCase):
         c["ndx_price_temperature"]["source_date"]="2026-06-21"
         failures=shadow.evaluate_day_gates(c,dt.date(2026,6,22),{})
         self.assertTrue(any(x["failed_field"]=="model_price_source_date" for x in failures))
+
+    def test_48b_primary_and_model_price_value_mismatch_fails(self):
+        c=shadow.canonical_shadow_view(canonical_report())
+        c["ndx_data_layer"]["price_primary"]["close"]=29999.0
+        failures=shadow.evaluate_day_gates(c,dt.date(2026,6,22),{})
+        self.assertTrue(any(x["failed_field"]=="model_ndx_value" for x in failures))
 
     def test_49_dfii10_is_macro_input_not_price_validator(self):
         layer=canonical_report()["copilot"]["ndx_data_layer"]

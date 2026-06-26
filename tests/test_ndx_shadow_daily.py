@@ -85,6 +85,14 @@ class NdxShadowDailyTests(unittest.TestCase):
 
     def test_accepted_dfii10_is_used_to_build_model_report(self):
         accepted = {
+            "accepted_ndx": {
+                "ndx_source": "FRED_NASDAQ100",
+                "ndx_instrument": "NDX",
+                "ndx_source_date": TARGET.isoformat(),
+                "ndx_value": 30000.0,
+                "ndx_retrieved_at": NOW.isoformat(),
+                "ndx_accepted_as_of_date": TARGET.isoformat(),
+            },
             "dfii10_source": "DFII10",
             "dfii10_source_date": TARGET.isoformat(),
             "dfii10_value": 2.31,
@@ -100,12 +108,64 @@ class NdxShadowDailyTests(unittest.TestCase):
             "dfii10": 2.31,
         }
         report = {"copilot": {"ndx_data_layer": {}, "ndx_price_temperature": {}}}
-        with mock.patch.object(daily, "latest_model_snapshot_with_accepted_dfii10", return_value=snapshot) as builder:
-            patched = daily.apply_shadow_inputs_to_report(report, TARGET, accepted)
-        builder.assert_called_once_with(accepted)
+        with mock.patch.object(daily, "latest_model_snapshot_with_accepted_inputs", return_value=snapshot) as builder:
+            patched = daily.apply_shadow_inputs_to_report(report, TARGET, accepted, accepted["accepted_ndx"])
+        builder.assert_called_once_with(accepted["accepted_ndx"], accepted)
+        self.assertEqual(patched["copilot"]["ndx_data_layer"]["price_primary"]["date"], TARGET.isoformat())
+        self.assertEqual(patched["copilot"]["ndx_data_layer"]["price_primary"]["close"], 30000.0)
         self.assertEqual(patched["copilot"]["ndx_price_temperature"]["dfii10"], 2.31)
         self.assertEqual(patched["copilot"]["ndx_data_layer"]["macro_inputs"][0]["date"], TARGET.isoformat())
         self.assertEqual(patched["copilot"]["ndx_data_layer"]["macro_inputs"][0]["value"], 2.31)
+
+    def test_execute_shadow_writes_isolated_prepared_snapshot(self):
+        accepted = {
+            "accepted_ndx": {
+                "ndx_source": "FRED_NASDAQ100",
+                "ndx_instrument": "NDX",
+                "ndx_source_date": TARGET.isoformat(),
+                "ndx_value": 30000.0,
+                "ndx_retrieved_at": NOW.isoformat(),
+                "ndx_accepted_as_of_date": TARGET.isoformat(),
+            },
+            "dfii10_source": "DFII10",
+            "dfii10_source_date": TARGET.isoformat(),
+            "dfii10_value": 2.31,
+            "dfii10_retrieved_at": NOW.isoformat(),
+            "dfii10_lag_trading_days": 0,
+            "dfii10_lag_status": "FRESH",
+            "dfii10_accepted_as_of_date": TARGET.isoformat(),
+        }
+        base_report = {
+            "copilot": {
+                "run_id": "run-test",
+                "ndx_price_temperature": {
+                    "source_name": daily.ndx_price_temperature.PRICE_SOURCE_NAME,
+                    "source_date": "2026-06-18",
+                },
+                "ndx_data_layer": {},
+            }
+        }
+        snapshot = {
+            "source_date": TARGET.isoformat(),
+            "ndx_close": 30000.0,
+            "dfii10_source_date": TARGET.isoformat(),
+            "dfii10": 2.31,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            report_path = Path(temp) / "report.json"
+            report_path.write_text(daily.json.dumps(base_report), encoding="utf-8")
+            prepared = Path(temp) / "prepared"
+            with mock.patch.object(daily, "latest_model_snapshot_with_accepted_inputs", return_value=snapshot), \
+                 mock.patch.object(daily, "PREPARED_REPORT_ROOT", prepared), \
+                mock.patch.object(daily.subprocess, "run") as runner:
+                runner.return_value = mock.Mock(returncode=0, stdout="")
+                result = daily.execute_shadow(TARGET, report_path=report_path, accepted_dfii10=accepted)
+                self.assertEqual(result, "SHADOW_EXECUTED")
+                files = list(prepared.glob("%s/*canonical-shadow-report.json" % TARGET.isoformat()))
+                self.assertEqual(len(files), 1)
+                payload = daily.json.loads(files[0].read_text(encoding="utf-8"))
+                self.assertEqual(payload["copilot"]["ndx_price_temperature"]["source_date"], TARGET.isoformat())
+                self.assertEqual(payload["copilot"]["ndx_data_layer"]["macro_inputs"][0]["value"], 2.31)
 
     def test_duplicate_completed_day_is_idempotent(self):
         result, shadow, exists = self.run_with([], ledger_done=True)

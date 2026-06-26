@@ -25,6 +25,7 @@ import ndx_shadow_run
 
 
 SLA_PATH = ROOT / "reports/shadow/ndx-v1/source-sla.json"
+PREPARED_REPORT_ROOT = ROOT / "reports/shadow/ndx-v1/prepared"
 NDX_CSV = ROOT / "data/ndx_history/ndx_daily.csv"
 DFII10_CSV = ROOT / "data/ndx_history/dfii10_daily.csv"
 LEDGER_PATH = ROOT / "reports/shadow/ndx-v1/shadow-ledger.json"
@@ -163,10 +164,12 @@ def evaluate_dfii10_freshness(dfii10_date, target_date):
 
 
 def precheck(target_date):
+    ndx = fetch_fred_observation("NASDAQ100")
     dfii10 = fetch_fred_observation("DFII10")
     dfii10_freshness = evaluate_dfii10_freshness(dfii10["date"], target_date)
     return {
-        "fred_ndx_date": fetch_fred_date("NASDAQ100"),
+        "fred_ndx_date": ndx["date"],
+        "fred_ndx_value": ndx["value"],
         "fred_dfii10_date": dfii10["date"],
         "fred_dfii10_value": dfii10["value"],
         "dfii10_lag_trading_days": dfii10_freshness["lag_trading_days"],
@@ -199,6 +202,20 @@ def refresh_and_validate(target_date, accepted_dfii10=None):
     return local_ndx == target_date and local_dfii10 == accepted_dfii10_date, local_ndx, local_dfii10
 
 
+def accepted_ndx_from_check(check, target_date, retrieved_at):
+    ndx_date = ndx_shadow_run._parse_date(check.get("fred_ndx_date"))
+    if ndx_date != target_date:
+        return None
+    return {
+        "ndx_source": ndx_shadow_run.NDX_PRIMARY_SOURCE,
+        "ndx_instrument": ndx_shadow_run.NDX_PRIMARY_INSTRUMENT,
+        "ndx_source_date": ndx_date.isoformat(),
+        "ndx_value": check.get("fred_ndx_value"),
+        "ndx_retrieved_at": retrieved_at,
+        "ndx_accepted_as_of_date": ndx_date.isoformat(),
+    }
+
+
 def accepted_dfii10_from_check(check, target_date, retrieved_at):
     freshness = evaluate_dfii10_freshness(check.get("fred_dfii10_date"), target_date)
     if freshness["status"] not in ("FRESH", "ACCEPTABLE_LAG"):
@@ -214,9 +231,15 @@ def accepted_dfii10_from_check(check, target_date, retrieved_at):
     }
 
 
-def latest_model_snapshot_with_accepted_dfii10(accepted_dfii10):
+def latest_model_snapshot_with_accepted_inputs(accepted_ndx, accepted_dfii10):
     prices = ndx_price_temperature.read_fred_csv(NDX_CSV, "NASDAQ100")
     rate_daily = ndx_price_temperature.read_fred_csv(DFII10_CSV, "DFII10")
+    accepted_ndx_date = ndx_shadow_run._parse_date(accepted_ndx.get("ndx_source_date"))
+    accepted_ndx_value = accepted_ndx.get("ndx_value")
+    if accepted_ndx_date and accepted_ndx_value is not None:
+        prices = [(date, value) for date, value in prices if date < accepted_ndx_date]
+        prices.append((accepted_ndx_date, float(accepted_ndx_value)))
+        prices.sort(key=lambda item: item[0])
     accepted_date = ndx_shadow_run._parse_date(accepted_dfii10.get("dfii10_source_date"))
     accepted_value = accepted_dfii10.get("dfii10_value")
     if accepted_date and accepted_value is not None:
@@ -229,11 +252,27 @@ def latest_model_snapshot_with_accepted_dfii10(accepted_dfii10):
     return snapshot
 
 
-def apply_shadow_inputs_to_report(report, target_date, accepted_dfii10):
+def latest_model_snapshot_with_accepted_dfii10(accepted_dfii10):
+    accepted_ndx = {
+        "ndx_source": ndx_shadow_run.NDX_PRIMARY_SOURCE,
+        "ndx_instrument": ndx_shadow_run.NDX_PRIMARY_INSTRUMENT,
+        "ndx_source_date": local_csv_max_date(NDX_CSV, "NASDAQ100").isoformat(),
+        "ndx_value": ndx_price_temperature.read_fred_csv(NDX_CSV, "NASDAQ100")[-1][1],
+    }
+    return latest_model_snapshot_with_accepted_inputs(accepted_ndx, accepted_dfii10)
+
+
+def apply_shadow_inputs_to_report(report, target_date, accepted_dfii10, accepted_ndx=None):
     report = dict(report)
     copilot = dict(report.get("copilot", {}))
     report["copilot"] = copilot
-    model = latest_model_snapshot_with_accepted_dfii10(accepted_dfii10)
+    accepted_ndx = accepted_ndx or {
+        "ndx_source": ndx_shadow_run.NDX_PRIMARY_SOURCE,
+        "ndx_instrument": ndx_shadow_run.NDX_PRIMARY_INSTRUMENT,
+        "ndx_source_date": target_date.isoformat(),
+        "ndx_value": None,
+    }
+    model = latest_model_snapshot_with_accepted_inputs(accepted_ndx, accepted_dfii10)
     copilot["ndx_price_temperature"] = model
     ndx_data_layer = dict(copilot.get("ndx_data_layer") or {})
     ndx_data_layer.update({
@@ -242,9 +281,11 @@ def apply_shadow_inputs_to_report(report, target_date, accepted_dfii10):
             "source": ndx_shadow_run.NDX_PRIMARY_SOURCE,
             "instrument": ndx_shadow_run.NDX_PRIMARY_INSTRUMENT,
             "role": "NDX_PRIMARY",
-            "date": model.get("source_date"),
-            "close": model.get("ndx_close"),
+            "date": accepted_ndx.get("ndx_source_date"),
+            "close": accepted_ndx.get("ndx_value", model.get("ndx_close")),
             "price_field": "close",
+            "retrieved_at": accepted_ndx.get("ndx_retrieved_at"),
+            "accepted_as_of_date": accepted_ndx.get("ndx_accepted_as_of_date"),
         },
         "macro_inputs": [{
             "source": "DFII10",
@@ -267,6 +308,18 @@ def apply_shadow_inputs_to_report(report, target_date, accepted_dfii10):
     return report
 
 
+def write_prepared_shadow_report(report, target_date, prepared_root=None):
+    target_dir = Path(prepared_root or PREPARED_REPORT_ROOT) / target_date.isoformat()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    run_id = report.get("copilot", {}).get("run_id") or "shadow"
+    generated = now_sgt().strftime("%Y%m%dT%H%M%S%z")
+    path = target_dir / ("%s-%s-canonical-shadow-report.json" % (generated, run_id))
+    with path.open("x", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    return path
+
+
 def execute_shadow(target_date, report_path=None, accepted_dfii10=None):
     report_path = Path(report_path) if report_path else latest_report_path()
     if not report_path:
@@ -275,17 +328,15 @@ def execute_shadow(target_date, report_path=None, accepted_dfii10=None):
     if source != ndx_shadow_run.NDX_PRIMARY_SOURCE:
         return "MODEL_SNAPSHOT_NOT_READY"
     run_report = report_path
-    temporary = None
+    accepted_ndx = None
     if accepted_dfii10:
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        report = apply_shadow_inputs_to_report(report, target_date, accepted_dfii10)
+        accepted_ndx = accepted_dfii10.get("accepted_ndx")
+        report = apply_shadow_inputs_to_report(report, target_date, accepted_dfii10, accepted_ndx)
         model_date = ndx_shadow_run._parse_date(report.get("copilot", {}).get("ndx_price_temperature", {}).get("source_date"))
         if model_date != target_date:
             return "MODEL_SNAPSHOT_NOT_READY"
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
-            json.dump(report, handle, ensure_ascii=False)
-            temporary = Path(handle.name)
-            run_report = temporary
+        run_report = write_prepared_shadow_report(report, target_date)
     elif model_date != target_date:
         return "MODEL_SNAPSHOT_NOT_READY"
     command = [
@@ -295,17 +346,10 @@ def execute_shadow(target_date, report_path=None, accepted_dfii10=None):
         "--report", str(run_report),
         "--browser-verified",
     ]
-    try:
-        completed = subprocess.run(command, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=900)
-        if completed.returncode:
-            raise DailyShadowError(completed.stdout.strip() or "shadow runner failed")
-        return "SHADOW_EXECUTED"
-    finally:
-        if temporary:
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
+    completed = subprocess.run(command, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=900)
+    if completed.returncode:
+        raise DailyShadowError(completed.stdout.strip() or "shadow runner failed")
+    return "SHADOW_EXECUTED"
 
 
 def run_once(now=None, sleep_until_retry=True, sla_path=SLA_PATH, shadow_executor=execute_shadow):
@@ -333,7 +377,11 @@ def run_once(now=None, sleep_until_retry=True, sla_path=SLA_PATH, shadow_executo
     shadow_executed = False
     final_status = status
     if status == "READY":
-        accepted_dfii10 = accepted_dfii10_from_check(final_check, target, now_sgt().isoformat(timespec="seconds"))
+        retrieved_at = now_sgt().isoformat(timespec="seconds")
+        accepted_ndx = accepted_ndx_from_check(final_check, target, retrieved_at)
+        accepted_dfii10 = accepted_dfii10_from_check(final_check, target, retrieved_at)
+        if accepted_dfii10 and accepted_ndx:
+            accepted_dfii10["accepted_ndx"] = accepted_ndx
         ok, local_ndx, local_dfii10 = refresh_and_validate(target, accepted_dfii10)
         final_check["local_ndx_date"] = local_ndx
         final_check["local_dfii10_date"] = local_dfii10
@@ -350,6 +398,7 @@ def run_once(now=None, sleep_until_retry=True, sla_path=SLA_PATH, shadow_executo
         "first_check_at": first_at,
         "retry_check_at": retry_at,
         "fred_ndx_date": final_check["fred_ndx_date"].isoformat() if final_check.get("fred_ndx_date") else None,
+        "ndx_value": final_check.get("fred_ndx_value"),
         "fred_dfii10_date": final_check["fred_dfii10_date"].isoformat() if final_check.get("fred_dfii10_date") else None,
         "local_ndx_date": final_check["local_ndx_date"].isoformat() if final_check.get("local_ndx_date") else None,
         "local_dfii10_date": final_check["local_dfii10_date"].isoformat() if final_check.get("local_dfii10_date") else None,

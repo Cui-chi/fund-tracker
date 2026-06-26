@@ -235,6 +235,14 @@ def evaluate_model_price_consistency(data_layer, model):
     instrument_match = primary.get("instrument") == NDX_PRIMARY_INSTRUMENT
     source_match = model_source == primary.get("source")
     date_match = model_date == primary_date
+    try:
+        primary_close = float(primary.get("close"))
+        model_close = float(model.get("ndx_close"))
+        close_match = math.isclose(primary_close, model_close, rel_tol=0, abs_tol=1e-9)
+    except (TypeError, ValueError):
+        primary_close = primary.get("close")
+        model_close = model.get("ndx_close")
+        close_match = False
     if not instrument_match:
         return {
             "decision": "CRITICAL_FAIL",
@@ -274,6 +282,21 @@ def evaluate_model_price_consistency(data_layer, model):
             "source_identity_match": source_match,
             "source_date_match": False,
         }
+    if not close_match:
+        return {
+            "decision": "CRITICAL_FAIL",
+            "reason": "primary and model price value mismatch",
+            "field": "model_ndx_value",
+            "primary_instrument": primary.get("instrument"),
+            "primary_source": primary.get("source"),
+            "primary_source_date": primary.get("date"),
+            "primary_ndx_value": primary.get("close"),
+            "model_price_source": model_source,
+            "model_price_source_date": model.get("source_date"),
+            "model_ndx_value": model.get("ndx_close"),
+            "source_identity_match": source_match,
+            "source_date_match": date_match,
+        }
     return {
         "decision": "PASS",
         "reason": "primary and model price input aligned",
@@ -283,6 +306,8 @@ def evaluate_model_price_consistency(data_layer, model):
         "primary_source_date": primary.get("date"),
         "model_price_source": model_source,
         "model_price_source_date": model.get("source_date"),
+        "primary_ndx_value": primary.get("close"),
+        "model_ndx_value": model.get("ndx_close"),
         "source_identity_match": True,
         "source_date_match": True,
     }
@@ -645,6 +670,8 @@ def evaluate_day_gates(canonical, session_date, input_hashes, input_manifest=Non
                 "primary_source_date": model_price_gate.get("primary_source_date"),
                 "model_price_source": model_price_gate.get("model_price_source"),
                 "model_price_source_date": model_price_gate.get("model_price_source_date"),
+                "primary_ndx_value": model_price_gate.get("primary_ndx_value"),
+                "model_ndx_value": model_price_gate.get("model_ndx_value"),
             },
             "root_cause": model_price_gate["reason"],
         })
@@ -919,11 +946,14 @@ def run_shadow_session(report_path, ledger_path, shadow_root, session_date, eval
     ndx_data_layer = canonical.get("ndx_data_layer") or fetch_ndx_data_layer(session_date)
     with ledger_lock(ledger_path):
         ledger = load_ledger(ledger_path)
-        if ledger["status"] in ("SHADOW_COMPLETE", "SHADOW_FAILED"):
+        if ledger["status"] == "SHADOW_COMPLETE":
             raise ShadowRunError("shadow ledger does not accept additional days")
         if any(row["market_session_date"] == session_date.isoformat() for row in ledger["days"]):
             return {**pending_status(ledger, evaluated_at), "market_session": session,
                     "reason": "DUPLICATE_MARKET_SESSION_DATE"}
+        if any(row.get("market_session_date") == session_date.isoformat() for row in ledger.get("failures", [])):
+            return {**pending_status(ledger, evaluated_at), "market_session": session,
+                    "reason": "DUPLICATE_FAILED_MARKET_SESSION_DATE"}
         if any(row["run_id"] == canonical["run_id"] for row in ledger["days"]):
             return {**pending_status(ledger, evaluated_at), "market_session": session,
                     "reason": "DUPLICATE_RUN_ID"}
@@ -973,6 +1003,8 @@ def run_shadow_session(report_path, ledger_path, shadow_root, session_date, eval
             "primary_source_date": source_identity.get("primary_source_date"),
             "model_price_source": source_identity.get("model_price_source"),
             "model_price_source_date": source_identity.get("model_price_source_date"),
+            "primary_ndx_value": source_identity.get("primary_ndx_value"),
+            "model_ndx_value": source_identity.get("model_ndx_value"),
             "source_identity_match": source_identity.get("source_identity_match"),
             "source_date_match": source_identity.get("source_date_match"),
             "model_dfii10_source_date": macro_identity.get("model_dfii10_source_date"),
