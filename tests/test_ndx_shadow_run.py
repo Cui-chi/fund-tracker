@@ -369,5 +369,66 @@ class NdxShadowRunTests(unittest.TestCase):
             curl.return_value = "observation_date,NASDAQ100\n2026-06-22,30000.1\n2026-06-23,30010.2\n"
             self.assertEqual(shadow.fetch_ndx_primary(), {"source": "FRED_NASDAQ100", "date": "2026-06-23", "close": 30010.2, "instrument": "NDX", "role": "NDX_PRIMARY", "price_field": "close"})
 
+    def test_52_canonical_hash_stable_for_same_business_input(self):
+        c=shadow.canonical_shadow_view(canonical_report())
+        h1=shadow.canonical_input_hash(c,dt.date(2026,6,22),c["ndx_data_layer"])
+        h2=shadow._sha256_bytes(shadow._canonical_json(dict(reversed(list(shadow.canonical_input_payload(c,dt.date(2026,6,22),c["ndx_data_layer"]).items())))))
+        self.assertEqual(h1,h2)
+
+    def test_53_canonical_hash_ignores_runtime_fields(self):
+        c1=shadow.canonical_shadow_view(canonical_report())
+        c2=shadow.canonical_shadow_view(canonical_report())
+        c2["run_id"]="different-run"
+        c2["generated_at"]="2099-01-01T00:00:00+00:00"
+        c2["ndx_price_temperature"]["retrieved_at"]="2099-01-01T00:00:00+00:00"
+        h1=shadow.canonical_input_hash(c1,dt.date(2026,6,22),c1["ndx_data_layer"])
+        h2=shadow.canonical_input_hash(c2,dt.date(2026,6,22),c2["ndx_data_layer"])
+        self.assertEqual(h1,h2)
+
+    def test_54_canonical_hash_changes_when_ndx_changes(self):
+        c=shadow.canonical_shadow_view(canonical_report())
+        h1=shadow.canonical_input_hash(c,dt.date(2026,6,22),c["ndx_data_layer"])
+        c["ndx_data_layer"]["price_primary"]["close"]=30001.0
+        c["ndx_price_temperature"]["ndx_close"]=30001.0
+        h2=shadow.canonical_input_hash(c,dt.date(2026,6,22),c["ndx_data_layer"])
+        self.assertNotEqual(h1,h2)
+
+    def test_55_canonical_hash_changes_when_dfii10_changes(self):
+        c=shadow.canonical_shadow_view(canonical_report())
+        h1=shadow.canonical_input_hash(c,dt.date(2026,6,22),c["ndx_data_layer"])
+        c["ndx_data_layer"]["macro_inputs"][0]["value"]=2.21
+        c["ndx_price_temperature"]["dfii10"]=2.21
+        h2=shadow.canonical_input_hash(c,dt.date(2026,6,22),c["ndx_data_layer"])
+        self.assertNotEqual(h1,h2)
+
+    def test_56_manifest_canonical_hash_controls_gate_not_raw_hash(self):
+        c=shadow.canonical_shadow_view(canonical_report())
+        manifest={"canonical_input_hash":shadow.canonical_input_hash(c,dt.date(2026,6,22),c["ndx_data_layer"]),
+                  "hash_match":True,"inputs":{}}
+        hashes={"qdii-carrier-snapshot-raw.json":"0"*64}
+        failures=shadow.evaluate_day_gates(c,dt.date(2026,6,22),hashes,manifest,c["ndx_data_layer"])
+        self.assertFalse(any(x["failed_field"]=="carrier_raw_sha256" for x in failures))
+        self.assertFalse(any(x["failed_field"]=="canonical_input_hash" for x in failures))
+
+    def test_57_hash_match_false_blocks_without_release(self):
+        c=shadow.canonical_shadow_view(canonical_report())
+        manifest={"canonical_input_hash":shadow.canonical_input_hash(c,dt.date(2026,6,22),c["ndx_data_layer"]),
+                  "hash_match":False,"inputs":{}}
+        failures=shadow.evaluate_day_gates(c,dt.date(2026,6,22),{},manifest,c["ndx_data_layer"])
+        self.assertTrue(any(x["failed_field"]=="hash_match" for x in failures))
+        self.assertEqual(c["v7_decision_chain"]["formal_decision"]["formal_release_amount"],0.0)
+
+    def test_58_success_manifest_contains_canonical_and_raw_hashes(self):
+        with tempfile.TemporaryDirectory() as t:
+            r=Path(t); ledger=r/"ledger.json"; shadow.initialize_ledger(day0_report(r),ledger)
+            report,latest,raw=runnable_report(r)
+            output=shadow.run_shadow_session(report,ledger,r/"shadow",dt.date(2026,6,22),dt.datetime(2026,6,22,16,16,tzinfo=NY),latest,raw,True)
+            manifest=json.loads((r/"shadow"/"2026-06-22"/"inputs"/"input-manifest.json").read_text())
+            self.assertEqual(manifest["hash_algorithm"],"sha256")
+            self.assertEqual(manifest["hash_canonicalization_version"],shadow.HASH_CANONICALIZATION_VERSION)
+            self.assertTrue(manifest["hash_match"])
+            self.assertEqual(output["canonical_input_hash"],manifest["canonical_input_hash"])
+            self.assertIn("carrier_raw_snapshot_sha256",manifest["raw_snapshot_sha256"])
+
 
 if __name__ == "__main__": unittest.main()

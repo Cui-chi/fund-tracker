@@ -128,7 +128,19 @@ class NdxPriceTemperatureV1Tests(unittest.TestCase):
             self.assertIn(text, html)
 
     def test_31_overseas_gap_unchanged(self):
-        self.assertIn("15,898", Path("dist/Asset Allocation Copilot V7.html").read_text(encoding="utf-8"))
+        # 持仓可在「持仓管理」编辑，故海外权益缺口从当前 config 经同一管线推导，
+        # 再断言它出现在已渲染的 dashboard 中，而不是写死某个金额。
+        import fund_tracker
+        config = fund_tracker.load_config()
+        conn = fund_tracker.connect_db()
+        try:
+            temperature = fund_tracker.generate_market_temperature(conn, config)
+            snapshot = fund_tracker.generate_copilot_snapshot(conn, config, temperature)
+        finally:
+            conn.close()
+        gap = snapshot["gaps"]["us_equity"]
+        html = Path("dist/Asset Allocation Copilot V7.html").read_text(encoding="utf-8")
+        self.assertIn(f"{gap:+,.0f}", html)
 
     def test_32_historical_625_unchanged(self):
         self.assertIn("Historical Executed Amount: 625 元", Path("dist/Asset Allocation Copilot V7.html").read_text(encoding="utf-8"))

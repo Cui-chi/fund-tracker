@@ -24,6 +24,7 @@ NEW_YORK = tz.gettz("America/New_York")
 LOCAL_TZ = dt.timezone(dt.timedelta(hours=8))
 LEDGER_SCHEMA = "ndx-shadow-ledger-v1"
 DAILY_SCHEMA = "ndx-shadow-day-v1"
+HASH_CANONICALIZATION_VERSION = "ndx-shadow-canonical-input-v1"
 PRIMARY_QQQ_URL = "https://stooq.com/q/d/l/?s=qqq.us&i=d"
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=%s"
 NDX_PRIMARY_SOURCE = "FRED_NASDAQ100"
@@ -401,6 +402,63 @@ def _canonical_json(payload):
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def canonical_input_payload(canonical, session_date, ndx_data_layer=None):
+    model = canonical["ndx_price_temperature"]
+    chain = canonical["v7_decision_chain"]
+    primary = _primary_from_data_layer(ndx_data_layer or canonical.get("ndx_data_layer")) or {}
+    macro = _accepted_dfii10_from_data_layer(ndx_data_layer or canonical.get("ndx_data_layer")) or {}
+    carrier = chain["carrier_matching"]
+    formal = chain["formal_decision"]
+    return {
+        "schema_version": HASH_CANONICALIZATION_VERSION,
+        "target_trade_date": _parse_date(session_date).isoformat(),
+        "ndx": {
+            "source": primary.get("source"),
+            "instrument": primary.get("instrument"),
+            "source_date": primary.get("date"),
+            "value": primary.get("close"),
+            "model_source_date": model.get("source_date"),
+            "model_value": model.get("ndx_close"),
+            "formula_version": model.get("formula_version"),
+        },
+        "dfii10": {
+            "source": macro.get("source", "DFII10"),
+            "source_date": macro.get("date"),
+            "value": macro.get("value"),
+            "lag_status": macro.get("lag_status"),
+            "lag_trading_days": macro.get("lag_trading_days"),
+            "model_source_date": model.get("dfii10_source_date"),
+            "model_value": model.get("dfii10"),
+        },
+        "model": {
+            "formula_version": model.get("formula_version"),
+            "temperature_score": model.get("temperature_score"),
+            "candidate_effective_release_factor": model.get("candidate_effective_release_factor"),
+            "real_yield_modifier": model.get("real_yield_modifier"),
+            "volatility_cap": model.get("volatility_cap"),
+        },
+        "carrier": {
+            "carrier_snapshot_id": canonical.get("carrier_snapshot_id"),
+            "carrier_snapshot_valid": carrier.get("carrier_snapshot_valid"),
+            "current_effective_carrier_capacity": carrier.get("current_effective_carrier_capacity"),
+            "carrier_coverable_amount": carrier.get("carrier_coverable_amount"),
+            "retained_due_to_capacity": carrier.get("retained_due_to_capacity"),
+            "retained_due_to_carrier_block": carrier.get("retained_due_to_carrier_block"),
+        },
+        "decision": {
+            "decision_status": canonical["status"].get("decision_status"),
+            "dynamic_cash_pool_status": canonical["status"].get("dynamic_cash_pool_status"),
+            "formal_executable_amount": formal.get("formal_executable_amount"),
+            "formal_release_amount": formal.get("formal_release_amount"),
+            "retained_due_to_decision_freeze": formal.get("retained_due_to_decision_freeze"),
+        },
+    }
+
+
+def canonical_input_hash(canonical, session_date, ndx_data_layer=None):
+    return _sha256_bytes(_canonical_json(canonical_input_payload(canonical, session_date, ndx_data_layer)))
+
+
 def _ledger_hash(payload):
     body = dict(payload)
     body.pop("ledger_sha256", None)
@@ -732,18 +790,17 @@ def evaluate_day_gates(canonical, session_date, input_hashes, input_manifest=Non
         if not isinstance(value, str) or len(value) != 64:
             failures.append({"failed_gate": "audit", "failed_field": "input_hashes." + name,
                              "expected_value": "SHA-256", "actual_value": value, "root_cause": "input hash missing"})
-    canonical_hashes = canonical.get("input_hashes", {})
-    for canonical_name, archived_name in (
-        ("carrier_latest_sha256", "qdii-carrier-latest.json"),
-        ("carrier_raw_sha256", "qdii-carrier-snapshot-raw.json"),
-    ):
-        expected = canonical_hashes.get(canonical_name)
-        actual = input_hashes.get(archived_name)
-        if expected != actual:
-            failures.append({"failed_gate": "audit", "failed_field": canonical_name,
-                             "expected_value": expected, "actual_value": actual,
-                             "root_cause": "archived QDII input hash differs from canonical run input"})
     if input_manifest:
+        expected_hash = canonical_input_hash(canonical, session_date, data_layer)
+        actual_hash = input_manifest.get("canonical_input_hash")
+        if expected_hash != actual_hash:
+            failures.append({"failed_gate": "audit", "failed_field": "canonical_input_hash",
+                             "expected_value": expected_hash, "actual_value": actual_hash,
+                             "root_cause": "manifest canonical input hash differs from day gate canonical input hash"})
+        if not input_manifest.get("hash_match"):
+            failures.append({"failed_gate": "audit", "failed_field": "hash_match",
+                             "expected_value": True, "actual_value": input_manifest.get("hash_match"),
+                             "root_cause": "manifest canonical hash check failed"})
         metadata = input_manifest.get("inputs", {})
         for filename in ("qdii-carrier-latest.json", "portfolio-snapshot.json", "target-snapshot.json"):
             require("data.%s.stale_status" % filename, metadata.get(filename, {}).get("stale_status"), "PASS")
@@ -858,6 +915,7 @@ def archive_daily_inputs(day_dir, canonical, session_date, qdii_latest_path, qdi
     }
     hashes = {}
     metadata = {}
+    raw_audit_hashes = {}
     for name, payload in snapshots.items():
         path = inputs / name
         hashes[name] = _write_daily_input(path, payload)
@@ -876,6 +934,10 @@ def archive_daily_inputs(day_dir, canonical, session_date, qdii_latest_path, qdi
                     break
                 dst.write(block)
         hashes[name] = sha256_file(target)
+        if name == "qdii-carrier-snapshot-raw.json":
+            raw_audit_hashes["carrier_raw_snapshot_sha256"] = hashes[name]
+        if name == "qdii-carrier-latest.json":
+            raw_audit_hashes["carrier_latest_raw_snapshot_sha256"] = hashes[name]
         payload = json.loads(target.read_text(encoding="utf-8"))
         if name == "qdii-carrier-latest.json" and payload.get("schema_version") != "qdii-carrier-facts-v2":
             raise ShadowRunError("QDII facts schema is invalid")
@@ -886,9 +948,15 @@ def archive_daily_inputs(day_dir, canonical, session_date, qdii_latest_path, qdi
             "retrieved_at": retrieved_at, "schema_version": payload.get("schema_version"),
             "stale_status": snapshot.get("stale_status", "RAW_ARCHIVE"),
         }
+    manifest_canonical_hash = canonical_input_hash(canonical, session_date, ndx_data_layer)
     manifest = {
         "schema_version": "ndx-shadow-input-manifest-v1", "run_id": canonical["run_id"],
         "market_session_date": session_date.isoformat(), "archived_at": retrieved_at,
+        "hash_algorithm": "sha256",
+        "hash_canonicalization_version": HASH_CANONICALIZATION_VERSION,
+        "canonical_input_hash": manifest_canonical_hash,
+        "raw_snapshot_sha256": raw_audit_hashes,
+        "hash_match": True,
         "inputs": {name: {**metadata[name], "sha256": hashes[name]} for name in sorted(hashes)},
     }
     _atomic_write_json(inputs / "input-manifest.json", manifest, exclusive=True)
@@ -983,6 +1051,11 @@ def run_shadow_session(report_path, ledger_path, shadow_root, session_date, eval
             "v7_decision_chain": chain,
             "ndx_data_layer": ndx_data_layer,
             "input_manifest_sha256": hashes["input-manifest.json"],
+            "hash_algorithm": manifest.get("hash_algorithm"),
+            "hash_canonicalization_version": manifest.get("hash_canonicalization_version"),
+            "canonical_input_hash": manifest.get("canonical_input_hash"),
+            "raw_snapshot_sha256": manifest.get("raw_snapshot_sha256"),
+            "hash_match": manifest.get("hash_match"),
             "shadow_evaluation": {
                 "day_gate_pass": not failures, "increment_allowed": not failures,
                 "shadow_days_completed_after_run": ledger["shadow_days_completed"] + (0 if failures else 1),
@@ -990,6 +1063,8 @@ def run_shadow_session(report_path, ledger_path, shadow_root, session_date, eval
                 "primary_gate": evaluate_primary_shadow_gate(ndx_data_layer, session_date),
                 "model_price_consistency": evaluate_model_price_consistency(ndx_data_layer, model),
                 "macro_input_consistency": evaluate_macro_input_consistency(ndx_data_layer, model),
+                "canonical_input_hash": manifest.get("canonical_input_hash"),
+                "hash_match": manifest.get("hash_match"),
                 "validator_warnings": (ndx_data_layer or {}).get("validator_warnings", []),
             },
         }

@@ -165,7 +165,63 @@ class NdxShadowDailyTests(unittest.TestCase):
                 self.assertEqual(len(files), 1)
                 payload = daily.json.loads(files[0].read_text(encoding="utf-8"))
                 self.assertEqual(payload["copilot"]["ndx_price_temperature"]["source_date"], TARGET.isoformat())
+                self.assertEqual(payload["copilot"]["ndx_price_temperature"]["ndx_close"], 30000.0)
+                self.assertEqual(payload["copilot"]["prepared_snapshot_validation"]["macro_input_match"], True)
                 self.assertEqual(payload["copilot"]["ndx_data_layer"]["macro_inputs"][0]["value"], 2.31)
+
+    def test_prepared_snapshot_atomic_write_produces_valid_json(self):
+        payload = {
+            "copilot": {
+                "run_id": "atomic-ok",
+                "ndx_price_temperature": {
+                    "source_date": TARGET.isoformat(),
+                    "ndx_close": 30000.0,
+                    "dfii10_source_date": TARGET.isoformat(),
+                    "dfii10": 2.31,
+                    "date": TARGET,
+                },
+                "ndx_data_layer": {
+                    "price_primary": {"source": "FRED_NASDAQ100", "date": TARGET.isoformat(), "close": 30000.0},
+                    "macro_inputs": [{"source": "DFII10", "date": TARGET.isoformat(), "value": 2.31}],
+                },
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            path = daily.write_prepared_shadow_report(payload, TARGET, prepared_root=Path(temp))
+            loaded = daily.json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(loaded["copilot"]["ndx_price_temperature"]["date"], TARGET.isoformat())
+            self.assertFalse(list(Path(temp).glob("**/*.tmp")))
+
+    def test_prepared_snapshot_serialization_failure_leaves_no_final_json(self):
+        class NotSerializable:
+            pass
+        payload = {
+            "bad": NotSerializable(),
+            "copilot": {
+                "run_id": "atomic-fail",
+                "ndx_price_temperature": {
+                    "source_date": TARGET.isoformat(),
+                    "ndx_close": 30000.0,
+                    "dfii10_source_date": TARGET.isoformat(),
+                    "dfii10": 2.31,
+                },
+                "ndx_data_layer": {
+                    "price_primary": {"source": "FRED_NASDAQ100", "date": TARGET.isoformat(), "close": 30000.0},
+                    "macro_inputs": [{"source": "DFII10", "date": TARGET.isoformat(), "value": 2.31}],
+                },
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(TypeError):
+                daily.write_prepared_shadow_report(payload, TARGET, prepared_root=Path(temp))
+            self.assertFalse(list(Path(temp).glob("**/*canonical-shadow-report.json")))
+            self.assertFalse(list(Path(temp).glob("**/*.tmp")))
+
+    def test_invalid_prepared_snapshot_is_not_valid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "bad.json"
+            path.write_text('{"copilot": {"ndx_price_temperature": {"date": ', encoding="utf-8")
+            self.assertFalse(daily.prepared_snapshot_is_valid(path))
 
     def test_duplicate_completed_day_is_idempotent(self):
         result, shadow, exists = self.run_with([], ledger_done=True)

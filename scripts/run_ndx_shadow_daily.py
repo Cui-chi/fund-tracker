@@ -10,6 +10,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -272,7 +273,11 @@ def apply_shadow_inputs_to_report(report, target_date, accepted_dfii10, accepted
         "ndx_source_date": target_date.isoformat(),
         "ndx_value": None,
     }
-    model = latest_model_snapshot_with_accepted_inputs(accepted_ndx, accepted_dfii10)
+    model = _json_safe(latest_model_snapshot_with_accepted_inputs(accepted_ndx, accepted_dfii10))
+    model["source_date"] = accepted_ndx.get("ndx_source_date")
+    model["ndx_close"] = accepted_ndx.get("ndx_value", model.get("ndx_close"))
+    model["dfii10_source_date"] = accepted_dfii10.get("dfii10_source_date")
+    model["dfii10"] = accepted_dfii10.get("dfii10_value")
     copilot["ndx_price_temperature"] = model
     ndx_data_layer = dict(copilot.get("ndx_data_layer") or {})
     ndx_data_layer.update({
@@ -305,7 +310,61 @@ def apply_shadow_inputs_to_report(report, target_date, accepted_dfii10, accepted
     ndx_data_layer.setdefault("validator_warnings", [])
     ndx_data_layer.setdefault("fetch_errors", [])
     copilot["ndx_data_layer"] = ndx_data_layer
+    copilot["prepared_snapshot_validation"] = validate_prepared_snapshot_fields(report, target_date)
     return report
+
+
+def _json_safe(value):
+    if isinstance(value, dt.datetime):
+        return value.isoformat(timespec="seconds")
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def validate_prepared_snapshot_fields(report, target_date):
+    copilot = report.get("copilot", {})
+    model = copilot.get("ndx_price_temperature", {})
+    data_layer = copilot.get("ndx_data_layer", {})
+    primary = data_layer.get("price_primary", {})
+    macro = (data_layer.get("macro_inputs") or [{}])[0]
+    try:
+        ndx_value_match = float(primary.get("close")) == float(model.get("ndx_close"))
+    except (TypeError, ValueError):
+        ndx_value_match = False
+    try:
+        dfii10_value_match = float(macro.get("value")) == float(model.get("dfii10"))
+    except (TypeError, ValueError):
+        dfii10_value_match = False
+    result = {
+        "target_trade_date": target_date.isoformat(),
+        "accepted_ndx_source": primary.get("source"),
+        "accepted_ndx_source_date": primary.get("date"),
+        "model_ndx_source_date": model.get("source_date"),
+        "accepted_ndx_close": primary.get("close"),
+        "model_ndx_close": model.get("ndx_close"),
+        "accepted_dfii10_source_date": macro.get("date"),
+        "model_dfii10_source_date": model.get("dfii10_source_date"),
+        "accepted_dfii10_value": macro.get("value"),
+        "model_dfii10_value": model.get("dfii10"),
+        "ndx_input_match": primary.get("date") == model.get("source_date") and ndx_value_match,
+        "macro_input_match": macro.get("date") == model.get("dfii10_source_date") and dfii10_value_match,
+    }
+    result["status"] = "PASS" if result["ndx_input_match"] and result["macro_input_match"] else "CRITICAL_FAIL"
+    return result
+
+
+def prepared_snapshot_is_valid(path):
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    validation = payload.get("copilot", {}).get("prepared_snapshot_validation", {})
+    return validation.get("status") == "PASS"
 
 
 def write_prepared_shadow_report(report, target_date, prepared_root=None):
@@ -314,9 +373,29 @@ def write_prepared_shadow_report(report, target_date, prepared_root=None):
     run_id = report.get("copilot", {}).get("run_id") or "shadow"
     generated = now_sgt().strftime("%Y%m%dT%H%M%S%z")
     path = target_dir / ("%s-%s-canonical-shadow-report.json" % (generated, run_id))
-    with path.open("x", encoding="utf-8") as handle:
-        json.dump(report, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    payload = _json_safe(report)
+    validation = validate_prepared_snapshot_fields(payload, target_date)
+    payload.setdefault("copilot", {})["prepared_snapshot_validation"] = validation
+    if validation.get("status") != "PASS":
+        raise DailyShadowError("prepared snapshot field mismatch")
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        with temporary.open(encoding="utf-8") as handle:
+            json.load(handle)
+        os.replace(str(temporary), str(path))
+        with path.open(encoding="utf-8") as handle:
+            json.load(handle)
+    except Exception:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -336,7 +415,12 @@ def execute_shadow(target_date, report_path=None, accepted_dfii10=None):
         model_date = ndx_shadow_run._parse_date(report.get("copilot", {}).get("ndx_price_temperature", {}).get("source_date"))
         if model_date != target_date:
             return "MODEL_SNAPSHOT_NOT_READY"
-        run_report = write_prepared_shadow_report(report, target_date)
+        try:
+            run_report = write_prepared_shadow_report(report, target_date)
+        except Exception:
+            return "MODEL_SNAPSHOT_NOT_READY"
+        if not prepared_snapshot_is_valid(run_report):
+            return "MODEL_SNAPSHOT_NOT_READY"
     elif model_date != target_date:
         return "MODEL_SNAPSHOT_NOT_READY"
     command = [
