@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Daily 13:10 NDX V1 shadow-run orchestrator.
 
-This script does not change the NDX formula or V7 reports. It only checks
-FRED freshness, refreshes governed local CSV inputs when ready, records a
-single SLA ledger, and then delegates to the existing shadow runner.
+This script does not change the NDX formula. It checks FRED freshness,
+refreshes governed local CSV inputs when ready, records a single SLA
+ledger, and delegates to the existing shadow runner. After a successful
+shadow day it also triggers a best-effort, no-refetch dashboard resync
+(reuses already-fetched DB/config state) so Shadow Day X/Y on the V7
+dashboard does not lag until the next 09:10 daily update.
 """
 
 import argparse
@@ -545,7 +548,20 @@ def execute_shadow(target_date, report_path=None, accepted_dfii10=None):
     return "SHADOW_EXECUTED"
 
 
-def run_once(now=None, sleep_until_retry=True, sla_path=SLA_PATH, shadow_executor=execute_shadow):
+def refresh_dashboard_after_shadow_success():
+    """Best-effort V7 dashboard resync after a successful shadow day.
+
+    Reuses local_server.rebuild_outputs() so Shadow Day X/Y and Today's
+    Focus reflect today's ledger update without re-fetching NAV/macro/
+    valuation data (this script owns none of that fetch) and without
+    waiting for the next 09:10 daily update.
+    """
+    import local_server
+    local_server.rebuild_outputs(local_server.load_config(), phase="ndx-shadow-sync")
+
+
+def run_once(now=None, sleep_until_retry=True, sla_path=SLA_PATH, shadow_executor=execute_shadow,
+             dashboard_refresher=refresh_dashboard_after_shadow_success):
     now = now or now_sgt()
     target = latest_complete_us_session(now)
     if not target:
@@ -568,6 +584,8 @@ def run_once(now=None, sleep_until_retry=True, sla_path=SLA_PATH, shadow_executo
         status = ready_from_fred(retry, target)
         ready_attempt = "RETRY" if status == "READY" else "NONE"
     shadow_executed = False
+    dashboard_refreshed = False
+    dashboard_refresh_error = None
     final_status = status
     if status == "READY":
         retrieved_at = now_sgt().isoformat(timespec="seconds")
@@ -586,6 +604,14 @@ def run_once(now=None, sleep_until_retry=True, sla_path=SLA_PATH, shadow_executo
             except TypeError:
                 final_status = shadow_executor(target)
             shadow_executed = final_status == "SHADOW_EXECUTED"
+            if shadow_executed:
+                # Best-effort only: a dashboard resync failure must never
+                # undo an already-recorded shadow success or its ledger entry.
+                try:
+                    dashboard_refresher()
+                    dashboard_refreshed = True
+                except Exception as exc:
+                    dashboard_refresh_error = str(exc)
     record = {
         "target_trade_date": target.isoformat(),
         "first_check_at": first_at,
@@ -602,6 +628,8 @@ def run_once(now=None, sleep_until_retry=True, sla_path=SLA_PATH, shadow_executo
         "ready_attempt": ready_attempt,
         "final_status": final_status,
         "shadow_executed": shadow_executed,
+        "dashboard_refreshed": dashboard_refreshed,
+        "dashboard_refresh_error": dashboard_refresh_error,
     }
     upsert_sla_record(record, sla_path)
     return record

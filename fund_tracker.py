@@ -3696,7 +3696,7 @@ def generate_copilot_snapshot(conn, config, market_temperature,
     shadow_ledger_path = output_paths.REPORTS_ROOT / "shadow" / "ndx-v1" / "shadow-ledger.json"
     shadow_ledger = {
         "status": "DAY1_PENDING", "shadow_days_completed": 0,
-        "required_complete_days": 3, "activation_status": "NOT_ACTIVE",
+        "required_complete_days": ndx_shadow_run.REQUIRED_COMPLETE_DAYS, "activation_status": "NOT_ACTIVE",
     }
     if shadow_ledger_path.is_file():
         try:
@@ -3704,7 +3704,7 @@ def generate_copilot_snapshot(conn, config, market_temperature,
         except (OSError, ValueError, ndx_shadow_run.ShadowRunError):
             shadow_ledger = {
                 "status": "SHADOW_FAILED", "shadow_days_completed": 0,
-                "required_complete_days": 3, "activation_status": "NOT_ACTIVE",
+                "required_complete_days": ndx_shadow_run.REQUIRED_COMPLETE_DAYS, "activation_status": "NOT_ACTIVE",
             }
     snapshot = {
         "version": "V7",
@@ -3817,7 +3817,7 @@ def generate_copilot_snapshot(conn, config, market_temperature,
         "ready_for_ndx_shadow": bool(ndx_model.get("ready_for_ndx_shadow") or ndx_model.get("offline_pass")),
         "shadow_status": shadow_ledger.get("status", "DAY1_PENDING"),
         "shadow_days_completed": int(shadow_ledger.get("shadow_days_completed", 0)),
-        "shadow_required_complete_days": int(shadow_ledger.get("required_complete_days", 3)),
+        "shadow_required_complete_days": int(shadow_ledger.get("required_complete_days", ndx_shadow_run.REQUIRED_COMPLETE_DAYS)),
         "single_real_yield_factor": {
             "status": "UNDER_VALIDATION",
             "series": "DFII10",
@@ -6122,7 +6122,7 @@ def write_copilot_dashboard(
       </article>"""
     shadow_status = str(copilot.get("shadow_status") or "DAY1_PENDING")
     shadow_days_completed = int(copilot.get("shadow_days_completed", 0) or 0)
-    shadow_required_days = int(copilot.get("shadow_required_complete_days", 3) or 3)
+    shadow_required_days = int(copilot.get("shadow_required_complete_days", ndx_shadow_run.REQUIRED_COMPLETE_DAYS) or ndx_shadow_run.REQUIRED_COMPLETE_DAYS)
     shadow_banner = f"""
       <article class="panel" data-shadow-status="{html.escape(shadow_status)}">
         <span class="eyebrow">NDX Shadow Run</span>
@@ -6462,7 +6462,7 @@ def write_copilot_dashboard(
     # ── Overview rollups: 一句话原因 / Today's Focus / Alert Summary ──
     # 全部由既有快照字段组合而成，不引入任何新指标或新计算。
     shadow_done = int(copilot.get("shadow_days_completed", 0) or 0)
-    shadow_need = int(copilot.get("shadow_required_complete_days", 3) or 3)
+    shadow_need = int(copilot.get("shadow_required_complete_days", ndx_shadow_run.REQUIRED_COMPLETE_DAYS) or ndx_shadow_run.REQUIRED_COMPLETE_DAYS)
 
     if execution_disabled:
         hero_oneline = (

@@ -249,13 +249,15 @@ class NdxShadowRunTests(unittest.TestCase):
             expected={"ndx-price-input.json","ndx-data-layer.json","dfii10-input.json","qdii-carrier-latest.json","qdii-carrier-snapshot-raw.json","portfolio-snapshot.json","target-snapshot.json","input-manifest.json"}
             self.assertEqual({p.name for p in inputs.iterdir()},expected)
 
-    def test_37_three_pass_days_complete_without_activation(self):
+    def test_37_five_pass_days_complete_without_activation(self):
         with tempfile.TemporaryDirectory() as t:
             r=Path(t); ledger=r/"ledger.json"; shadow.initialize_ledger(day0_report(r),ledger)
-            for index,session in enumerate(("2026-06-22","2026-06-23","2026-06-24"),1):
+            sessions = ("2026-06-22","2026-06-23","2026-06-24","2026-06-25","2026-06-26")
+            self.assertEqual(len(sessions), shadow.REQUIRED_COMPLETE_DAYS)
+            for index,session in enumerate(sessions,1):
                 run_valid_day(r,ledger,session,"run-day%d" % index)
             final=shadow.load_ledger(ledger)
-            self.assertEqual((final["status"],final["shadow_days_completed"],final["activation_status"]),("SHADOW_COMPLETE",3,"NOT_ACTIVE"))
+            self.assertEqual((final["status"],final["shadow_days_completed"],final["activation_status"]),("SHADOW_COMPLETE",5,"NOT_ACTIVE"))
 
     def test_38_three_pass_days_keep_pool_frozen(self):
         with tempfile.TemporaryDirectory() as t:
@@ -285,7 +287,8 @@ class NdxShadowRunTests(unittest.TestCase):
     def test_41_completed_shadow_only_enters_manual_review(self):
         with tempfile.TemporaryDirectory() as t:
             r=Path(t); ledger=r/"ledger.json"; shadow.initialize_ledger(day0_report(r),ledger)
-            for index,session in enumerate(("2026-06-22","2026-06-23","2026-06-24"),1): run_valid_day(r,ledger,session,"run-day%d" % index)
+            sessions = ("2026-06-22","2026-06-23","2026-06-24","2026-06-25","2026-06-26")
+            for index,session in enumerate(sessions,1): run_valid_day(r,ledger,session,"run-day%d" % index)
             final=shadow.load_ledger(ledger)
             self.assertEqual(final["next_status"],"MANUAL_ACTIVATION_REVIEW")
             self.assertTrue(final["ready_for_manual_activation_review"])

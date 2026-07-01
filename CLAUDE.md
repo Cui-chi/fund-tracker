@@ -82,8 +82,8 @@ load_config() → connect_db() → sync_funds()
 
 ### NDX V1 影子运行（当前活跃工作，分支 `codex/ndx-v1-shadow-run`）
 
-- `ndx_shadow_run.py` — 受治理的三会话（3 个完整美股交易日）状态机，`REQUIRED_COMPLETE_DAYS = 3`，账本 schema `ndx-shadow-ledger-v1`。
-- `scripts/run_ndx_shadow_daily.py` — 每日 13:10（SGT）编排器：检查 FRED 新鲜度（`NASDAQ100`、`DFII10`）、就绪时刷新本地 CSV、写一条 SLA 账本、再委托 `scripts/run_ndx_shadow.py`。**它不改 NDX 公式，也不改 V7 报告。**
+- `ndx_shadow_run.py` — 受治理的五会话（5 个完整美股交易日）状态机，`REQUIRED_COMPLETE_DAYS = 5`，账本 schema `ndx-shadow-ledger-v1`。
+- `scripts/run_ndx_shadow_daily.py` — 每日 13:10（SGT）编排器：检查 FRED 新鲜度（`NASDAQ100`、`DFII10`）、就绪时刷新本地 CSV、写一条 SLA 账本、再委托 `scripts/run_ndx_shadow.py`。**它不改 NDX 公式。** 影子日执行成功后会额外触发一次轻量 dashboard 重渲染（复用 `local_server.rebuild_outputs()`，不重新抓取 NAV/宏观/估值数据），让首页 Shadow Day X/Y 与 Today's Focus 不必等到次日 09:10 才刷新；该刷新是尽力而为（best-effort），失败不影响已记录的影子成功与账本。
 - 价格来源遵循 SSOT（单一可信源），DFII10 作为宏观输入需与模型 as-of 日期对齐（见近期 commit）。
 
 ### 输出路径纪律（`utils/output_paths.py` — 输出路径的 SSOT）

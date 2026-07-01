@@ -86,7 +86,7 @@ def check(ndx, dfii10, local_ndx=None, local_dfii10=None):
 
 
 class NdxShadowDailyTests(unittest.TestCase):
-    def run_with(self, prechecks, refresh_ok=True, ledger_done=False, target=TARGET):
+    def run_with(self, prechecks, refresh_ok=True, ledger_done=False, target=TARGET, dashboard_refresher=None):
         with tempfile.TemporaryDirectory() as temp:
             sla = Path(temp) / "source-sla.json"
             def refresh_side_effect(target_date, accepted_dfii10=None):
@@ -99,7 +99,13 @@ class NdxShadowDailyTests(unittest.TestCase):
                  mock.patch.object(daily, "precheck", side_effect=prechecks), \
                  mock.patch.object(daily, "refresh_and_validate", side_effect=refresh_side_effect):
                 shadow = mock.Mock(return_value="SHADOW_EXECUTED")
-                result = daily.run_once(now=NOW, sleep_until_retry=False, sla_path=sla, shadow_executor=shadow)
+                # dashboard_refresher defaults to a no-op mock: this file's own
+                # scope is the READY/SHADOW_EXECUTED decision, not the real
+                # local_server dashboard rebuild, which the dedicated
+                # test_dashboard_refresh_* cases below exercise directly.
+                refresher = dashboard_refresher if dashboard_refresher is not None else mock.Mock()
+                result = daily.run_once(now=NOW, sleep_until_retry=False, sla_path=sla, shadow_executor=shadow,
+                                         dashboard_refresher=refresher)
                 return result, shadow, sla.exists()
 
     def test_first_check_ready_executes_shadow(self):
@@ -458,6 +464,38 @@ class NdxShadowDailyTests(unittest.TestCase):
         self.assertEqual(ndx_shadow_run.evaluate_primary_shadow_gate(layer, TARGET)["decision"], "CRITICAL_FAIL")
         formal = {"formal_executable_amount": 0.0, "formal_release_amount": 0.0}
         self.assertEqual((formal["formal_executable_amount"], formal["formal_release_amount"]), (0.0, 0.0))
+
+    def test_dashboard_refresh_called_after_shadow_executed(self):
+        refresher = mock.Mock()
+        result, shadow, _ = self.run_with([check(TARGET, TARGET)], dashboard_refresher=refresher)
+        self.assertEqual(result["final_status"], "SHADOW_EXECUTED")
+        refresher.assert_called_once_with()
+        self.assertTrue(result["dashboard_refreshed"])
+        self.assertIsNone(result["dashboard_refresh_error"])
+
+    def test_dashboard_refresh_not_called_when_not_ready(self):
+        refresher = mock.Mock()
+        not_ready = check(TARGET - dt.timedelta(days=1), TARGET)
+        result, shadow, _ = self.run_with([not_ready, not_ready], dashboard_refresher=refresher)
+        self.assertEqual(result["final_status"], "NOT_READY")
+        refresher.assert_not_called()
+        self.assertFalse(result["dashboard_refreshed"])
+
+    def test_dashboard_refresh_failure_does_not_undo_shadow_success(self):
+        refresher = mock.Mock(side_effect=RuntimeError("dist rebuild boom"))
+        result, shadow, exists = self.run_with([check(TARGET, TARGET)], dashboard_refresher=refresher)
+        self.assertEqual(result["final_status"], "SHADOW_EXECUTED")
+        self.assertTrue(result["shadow_executed"])
+        self.assertFalse(result["dashboard_refreshed"])
+        self.assertEqual(result["dashboard_refresh_error"], "dist rebuild boom")
+        self.assertTrue(exists)
+
+    def test_refresh_dashboard_after_shadow_success_reuses_rebuild_outputs(self):
+        with mock.patch("local_server.load_config", return_value={"fake": "config"}) as load_cfg, \
+             mock.patch("local_server.rebuild_outputs") as rebuild:
+            daily.refresh_dashboard_after_shadow_success()
+        load_cfg.assert_called_once_with()
+        rebuild.assert_called_once_with({"fake": "config"}, phase="ndx-shadow-sync")
 
 
 if __name__ == "__main__":

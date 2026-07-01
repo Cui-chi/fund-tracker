@@ -19,7 +19,7 @@ import ndx_price_temperature
 
 
 MODEL_VERSION = "NDX_PRICE_TEMPERATURE_V1_55_45_BALANCED"
-REQUIRED_COMPLETE_DAYS = 3
+REQUIRED_COMPLETE_DAYS = 5
 NEW_YORK = tz.gettz("America/New_York")
 LOCAL_TZ = dt.timezone(dt.timedelta(hours=8))
 LEDGER_SCHEMA = "ndx-shadow-ledger-v1"

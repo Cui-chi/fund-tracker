@@ -269,8 +269,8 @@ def apply_portfolio_update(current, payload, now_iso=None):
     return updated, portfolio_last_updated(updated)
 
 
-def rebuild_outputs(config):
-    run_dir = output_paths.create_run_dir("local-rebuild", force_new=True)
+def rebuild_outputs(config, phase="local-rebuild"):
+    run_dir = output_paths.create_run_dir(phase, force_new=True)
     conn = fund_tracker.connect_db()
     try:
         fund_tracker.sync_funds(conn, config)
@@ -320,7 +320,7 @@ def rebuild_outputs(config):
             macro_rows,
         )
         output_paths.write_run_manifest({
-            "phase": "local-rebuild", "task_name": "rebuild current dashboard",
+            "phase": phase, "task_name": "rebuild current dashboard",
             "decision_status": copilot.get("decision_status", "FREEZE"),
             "data_status": copilot.get("data_status", "FREEZE"),
             "model_status": copilot.get("model_status", "NOT_RUN"),
