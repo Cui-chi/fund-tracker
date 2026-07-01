@@ -134,6 +134,28 @@ def report_model_identity(report_path):
     return source, ndx_shadow_run._parse_date(model.get("source_date"))
 
 
+def report_model_fields(report_path):
+    """NDX/DFII10 identity fields whose presence determines report validity."""
+    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    model = report.get("copilot", {}).get("ndx_price_temperature", {})
+    return {
+        "model_ndx_source_date": model.get("source_date"),
+        "model_ndx_close": model.get("ndx_close"),
+        "model_dfii10_source_date": model.get("dfii10_source_date"),
+        "model_dfii10_value": model.get("dfii10"),
+    }
+
+
+def classify_latest_report(report_path):
+    """NO_REPORT / INVALID_REPORT / VALID_REPORT for the latest-report fallback decision."""
+    if not report_path:
+        return {"status": "NO_REPORT", "source": None, "model_date": None}
+    source, model_date = report_model_identity(report_path)
+    fields = report_model_fields(report_path)
+    valid = source == ndx_shadow_run.NDX_PRIMARY_SOURCE and all(value is not None for value in fields.values())
+    return {"status": "VALID_REPORT" if valid else "INVALID_REPORT", "source": source, "model_date": model_date}
+
+
 def trading_day_lag(source_date, target_date):
     source_date = ndx_shadow_run._parse_date(source_date)
     target_date = ndx_shadow_run._parse_date(target_date)
@@ -349,7 +371,15 @@ def build_minimal_shadow_report(target_date, accepted_dfii10):
     old_generated_at = os.environ.get("ASSET_COPILOT_GENERATED_AT")
     old_run_id = os.environ.get("ASSET_COPILOT_RUN_ID")
     fund_tracker.load_ndx_validation_snapshot = lambda: dict(model)
-    fund_tracker.output_paths.current_run_dir = lambda required=False: None
+    # generate_market_temperature()/generate_copilot_snapshot() write incidental
+    # CSV/JSON artifacts via output_paths.get_*_path(), which requires
+    # current_run_dir() to resolve to a real Path (None crashes). Use a scratch
+    # directory that is never archived into reports/runs/.
+    scratch_dir = tempfile.TemporaryDirectory(prefix="ndx-shadow-minimal-")
+    scratch_path = Path(scratch_dir.name)
+    for subdir in fund_tracker.output_paths._SUBDIRS.values():
+        (scratch_path / subdir).mkdir(parents=True, exist_ok=True)
+    fund_tracker.output_paths.current_run_dir = lambda required=False: scratch_path
     os.environ["ASSET_COPILOT_GENERATED_AT"] = generated_at
     os.environ["ASSET_COPILOT_RUN_ID"] = run_id
     conn = None
@@ -363,6 +393,7 @@ def build_minimal_shadow_report(target_date, accepted_dfii10):
             conn.close()
         fund_tracker.load_ndx_validation_snapshot = old_loader
         fund_tracker.output_paths.current_run_dir = old_current_run_dir
+        scratch_dir.cleanup()
         if old_generated_at is None:
             os.environ.pop("ASSET_COPILOT_GENERATED_AT", None)
         else:
@@ -467,9 +498,14 @@ def write_prepared_shadow_report(report, target_date, prepared_root=None):
 
 def execute_shadow(target_date, report_path=None, accepted_dfii10=None):
     report_path = Path(report_path) if report_path else latest_report_path()
-    if not report_path:
+    classification = classify_latest_report(report_path)
+    if classification["status"] != "VALID_REPORT":
+        # NO_REPORT or INVALID_REPORT: an invalid report (missing/None NDX or
+        # DFII10 identity fields, e.g. a report never touched by the shadow
+        # pipeline) must not block the fallback path any differently than a
+        # missing report would -- both need accepted daily inputs to recover.
         if not accepted_dfii10:
-            return "NO_REPORT"
+            return "NO_REPORT" if classification["status"] == "NO_REPORT" else "MODEL_SNAPSHOT_NOT_READY"
         try:
             report = build_minimal_shadow_report(target_date, accepted_dfii10)
         except Exception:
@@ -477,9 +513,7 @@ def execute_shadow(target_date, report_path=None, accepted_dfii10=None):
         model_date = ndx_shadow_run._parse_date(report.get("copilot", {}).get("ndx_price_temperature", {}).get("source_date"))
         run_report = None
     else:
-        source, model_date = report_model_identity(report_path)
-        if source != ndx_shadow_run.NDX_PRIMARY_SOURCE:
-            return "MODEL_SNAPSHOT_NOT_READY"
+        model_date = classification["model_date"]
         run_report = report_path
         report = None
     if accepted_dfii10:

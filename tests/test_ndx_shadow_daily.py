@@ -200,6 +200,9 @@ class NdxShadowDailyTests(unittest.TestCase):
                 "ndx_price_temperature": {
                     "source_name": daily.ndx_price_temperature.PRICE_SOURCE_NAME,
                     "source_date": "2026-06-18",
+                    "ndx_close": 29000.0,
+                    "dfii10_source_date": "2026-06-18",
+                    "dfii10": 2.20,
                 },
                 "ndx_data_layer": {},
             }
@@ -258,6 +261,87 @@ class NdxShadowDailyTests(unittest.TestCase):
         self.assertEqual(result, "SHADOW_EXECUTED")
         builder.assert_called_once_with(TARGET, accepted)
         runner.assert_called_once()
+
+    def _accepted_inputs(self):
+        return {
+            "accepted_ndx": {
+                "ndx_source": "FRED_NASDAQ100",
+                "ndx_instrument": "NDX",
+                "ndx_source_date": TARGET.isoformat(),
+                "ndx_value": 30000.0,
+                "ndx_retrieved_at": NOW.isoformat(),
+                "ndx_accepted_as_of_date": TARGET.isoformat(),
+            },
+            "dfii10_source": "DFII10",
+            "dfii10_source_date": TARGET.isoformat(),
+            "dfii10_value": 2.31,
+            "dfii10_retrieved_at": NOW.isoformat(),
+            "dfii10_lag_trading_days": 0,
+            "dfii10_lag_status": "FRESH",
+            "dfii10_accepted_as_of_date": TARGET.isoformat(),
+        }
+
+    def _run_fallback_case(self, temp, model, accepted):
+        report_path = Path(temp) / "report.json"
+        report_path.write_text(
+            daily.json.dumps({"copilot": {"run_id": "run-test", "ndx_price_temperature": model, "ndx_data_layer": {}}}),
+            encoding="utf-8",
+        )
+        minimal = {"copilot": canonical_copilot("minimal-run")}
+        prepared = Path(temp) / "prepared"
+        with mock.patch.object(daily, "build_minimal_shadow_report", return_value=minimal) as builder, \
+             mock.patch.object(daily, "PREPARED_REPORT_ROOT", prepared), \
+             mock.patch.object(daily.subprocess, "run") as runner:
+            runner.return_value = mock.Mock(returncode=0, stdout="")
+            result = daily.execute_shadow(TARGET, report_path=report_path, accepted_dfii10=accepted)
+        builder.assert_called_once_with(TARGET, accepted)
+        files = list(prepared.glob("%s/*canonical-shadow-report.json" % TARGET.isoformat()))
+        self.assertEqual(len(files), 1)
+        payload = daily.json.loads(files[0].read_text(encoding="utf-8"))
+        return result, payload
+
+    def test_report_with_none_ndx_identity_falls_back_to_minimal_snapshot(self):
+        model = {
+            "source_name": daily.ndx_price_temperature.PRICE_SOURCE_NAME,
+            "source_date": None,
+            "ndx_close": None,
+            "dfii10_source_date": TARGET.isoformat(),
+            "dfii10": 2.20,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            result, payload = self._run_fallback_case(temp, model, self._accepted_inputs())
+        self.assertNotEqual(result, "MODEL_SNAPSHOT_NOT_READY")
+        self.assertEqual(result, "SHADOW_EXECUTED")
+        self.assertEqual(payload["copilot"]["prepared_snapshot_validation"]["ndx_input_match"], True)
+        self.assertEqual(payload["copilot"]["prepared_snapshot_validation"]["macro_input_match"], True)
+        self.assertEqual(payload["copilot"]["prepared_snapshot_validation"]["status"], "PASS")
+
+    def test_report_with_none_dfii10_identity_falls_back_to_minimal_snapshot(self):
+        model = {
+            "source_name": daily.ndx_price_temperature.PRICE_SOURCE_NAME,
+            "source_date": "2026-06-18",
+            "ndx_close": 29000.0,
+            "dfii10_source_date": None,
+            "dfii10": None,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            result, payload = self._run_fallback_case(temp, model, self._accepted_inputs())
+        self.assertNotEqual(result, "MODEL_SNAPSHOT_NOT_READY")
+        self.assertEqual(result, "SHADOW_EXECUTED")
+        self.assertEqual(payload["copilot"]["prepared_snapshot_validation"]["ndx_input_match"], True)
+        self.assertEqual(payload["copilot"]["prepared_snapshot_validation"]["macro_input_match"], True)
+        self.assertEqual(payload["copilot"]["prepared_snapshot_validation"]["status"], "PASS")
+
+    def test_invalid_report_without_accepted_inputs_returns_model_snapshot_not_ready(self):
+        model = {"source_name": daily.ndx_price_temperature.PRICE_SOURCE_NAME, "source_date": None}
+        with tempfile.TemporaryDirectory() as temp:
+            report_path = Path(temp) / "report.json"
+            report_path.write_text(
+                daily.json.dumps({"copilot": {"run_id": "run-test", "ndx_price_temperature": model, "ndx_data_layer": {}}}),
+                encoding="utf-8",
+            )
+            result = daily.execute_shadow(TARGET, report_path=report_path)
+        self.assertEqual(result, "MODEL_SNAPSHOT_NOT_READY")
 
     def test_no_report_without_accepted_inputs_remains_no_report(self):
         with mock.patch.object(daily, "latest_report_path", return_value=None):
