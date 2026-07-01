@@ -143,7 +143,10 @@ class NdxPriceTemperatureV1Tests(unittest.TestCase):
         self.assertIn(f"{gap:+,.0f}", html)
 
     def test_32_historical_625_unchanged(self):
-        self.assertIn("Historical Executed Amount: 625 元", Path("dist/Asset Allocation Copilot V7.html").read_text(encoding="utf-8"))
+        html = Path("dist/Asset Allocation Copilot V7.html").read_text(encoding="utf-8")
+        self.assertIn("Historical Executed Amount", html)
+        self.assertIn("<td>2026-06</td>", html)
+        self.assertIn("<td>625</td>", html)
 
     def test_33_a500_regression(self):
         self.assertTrue(cn_equity_temperature.LIVE_SCORING_ENABLED)

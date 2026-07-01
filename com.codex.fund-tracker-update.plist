@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.codex.fund-tracker-update</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>/Users/cuichi/Documents/New project/fund_tracker/scripts/run_scheduled_update.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/cuichi/Documents/New project/fund_tracker</string>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>10</integer>
+  </dict>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>HTTP_PROXY</key>
+    <string>http://127.0.0.1:7890</string>
+    <key>HTTPS_PROXY</key>
+    <string>http://127.0.0.1:7890</string>
+    <key>ALL_PROXY</key>
+    <string>http://127.0.0.1:7890</string>
+    <key>NO_PROXY</key>
+    <string>localhost,127.0.0.1,::1</string>
+    <key>http_proxy</key>
+    <string>http://127.0.0.1:7890</string>
+    <key>https_proxy</key>
+    <string>http://127.0.0.1:7890</string>
+    <key>all_proxy</key>
+    <string>http://127.0.0.1:7890</string>
+    <key>no_proxy</key>
+    <string>localhost,127.0.0.1,::1</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+
+  <key>StandardErrorPath</key>
+  <string>/dev/null</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
