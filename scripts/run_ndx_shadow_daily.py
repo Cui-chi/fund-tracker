@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
 
 import ndx_price_temperature
 import ndx_shadow_run
+import qdii_carrier
 
 
 SLA_PATH = ROOT / "reports/shadow/ndx-v1/source-sla.json"
@@ -314,6 +315,71 @@ def apply_shadow_inputs_to_report(report, target_date, accepted_dfii10, accepted
     return report
 
 
+def build_minimal_shadow_report(target_date, accepted_dfii10):
+    """Build a canonical shadow payload from accepted daily inputs.
+
+    This is a fallback for Daily READY runs where no full V7 report has been
+    generated yet. It reuses the existing V7 copilot snapshot builder, but
+    injects the target-date NDX model snapshot and avoids report-run archiving.
+    """
+    accepted_ndx = (accepted_dfii10 or {}).get("accepted_ndx")
+    if not accepted_dfii10 or not accepted_ndx:
+        raise DailyShadowError("accepted NDX/DFII10 inputs are required")
+    import fund_tracker
+
+    model = _json_safe(latest_model_snapshot_with_accepted_inputs(accepted_ndx, accepted_dfii10))
+    model["source_date"] = accepted_ndx.get("ndx_source_date")
+    model["ndx_close"] = accepted_ndx.get("ndx_value", model.get("ndx_close"))
+    model["dfii10_source_date"] = accepted_dfii10.get("dfii10_source_date")
+    model["dfii10"] = accepted_dfii10.get("dfii10_value")
+    model["volatility_data_status"] = model.get("volatility_data_status") or model.get("price_data_status")
+    model["validation_stage"] = "OFFLINE_PASS"
+    model["offline_pass"] = True
+
+    try:
+        raw_snapshot = json.loads(qdii_carrier.RAW_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        qdii_carrier.write_carrier_fact_snapshot(raw_snapshot, output_path=qdii_carrier.CARRIER_JSON_PATH)
+    except (OSError, ValueError, TypeError, qdii_carrier.CarrierContractError):
+        pass
+
+    generated_at = now_sgt().isoformat(timespec="seconds")
+    run_id = "%s_ndx-shadow-minimal" % target_date.isoformat()
+    old_loader = fund_tracker.load_ndx_validation_snapshot
+    old_current_run_dir = fund_tracker.output_paths.current_run_dir
+    old_generated_at = os.environ.get("ASSET_COPILOT_GENERATED_AT")
+    old_run_id = os.environ.get("ASSET_COPILOT_RUN_ID")
+    fund_tracker.load_ndx_validation_snapshot = lambda: dict(model)
+    fund_tracker.output_paths.current_run_dir = lambda required=False: None
+    os.environ["ASSET_COPILOT_GENERATED_AT"] = generated_at
+    os.environ["ASSET_COPILOT_RUN_ID"] = run_id
+    conn = None
+    try:
+        config = fund_tracker.load_config()
+        conn = fund_tracker.connect_db()
+        market_temperature = fund_tracker.generate_market_temperature(conn, config)
+        copilot = fund_tracker.generate_copilot_snapshot(conn, config, market_temperature)
+    finally:
+        if conn is not None:
+            conn.close()
+        fund_tracker.load_ndx_validation_snapshot = old_loader
+        fund_tracker.output_paths.current_run_dir = old_current_run_dir
+        if old_generated_at is None:
+            os.environ.pop("ASSET_COPILOT_GENERATED_AT", None)
+        else:
+            os.environ["ASSET_COPILOT_GENERATED_AT"] = old_generated_at
+        if old_run_id is None:
+            os.environ.pop("ASSET_COPILOT_RUN_ID", None)
+        else:
+            os.environ["ASSET_COPILOT_RUN_ID"] = old_run_id
+
+    copilot.setdefault("input_hashes", {})
+    if qdii_carrier.CARRIER_JSON_PATH.is_file():
+        copilot["input_hashes"]["carrier_latest_sha256"] = ndx_shadow_run.sha256_file(qdii_carrier.CARRIER_JSON_PATH)
+    if qdii_carrier.RAW_SNAPSHOT_PATH.is_file():
+        copilot["input_hashes"]["carrier_raw_sha256"] = ndx_shadow_run.sha256_file(qdii_carrier.RAW_SNAPSHOT_PATH)
+    return apply_shadow_inputs_to_report({"copilot": copilot}, target_date, accepted_dfii10, accepted_ndx)
+
+
 def _json_safe(value):
     if isinstance(value, dt.datetime):
         return value.isoformat(timespec="seconds")
@@ -402,14 +468,23 @@ def write_prepared_shadow_report(report, target_date, prepared_root=None):
 def execute_shadow(target_date, report_path=None, accepted_dfii10=None):
     report_path = Path(report_path) if report_path else latest_report_path()
     if not report_path:
-        return "NO_REPORT"
-    source, model_date = report_model_identity(report_path)
-    if source != ndx_shadow_run.NDX_PRIMARY_SOURCE:
-        return "MODEL_SNAPSHOT_NOT_READY"
-    run_report = report_path
-    accepted_ndx = None
+        if not accepted_dfii10:
+            return "NO_REPORT"
+        try:
+            report = build_minimal_shadow_report(target_date, accepted_dfii10)
+        except Exception:
+            return "MODEL_SNAPSHOT_NOT_READY"
+        model_date = ndx_shadow_run._parse_date(report.get("copilot", {}).get("ndx_price_temperature", {}).get("source_date"))
+        run_report = None
+    else:
+        source, model_date = report_model_identity(report_path)
+        if source != ndx_shadow_run.NDX_PRIMARY_SOURCE:
+            return "MODEL_SNAPSHOT_NOT_READY"
+        run_report = report_path
+        report = None
     if accepted_dfii10:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if report is None:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
         accepted_ndx = accepted_dfii10.get("accepted_ndx")
         report = apply_shadow_inputs_to_report(report, target_date, accepted_dfii10, accepted_ndx)
         model_date = ndx_shadow_run._parse_date(report.get("copilot", {}).get("ndx_price_temperature", {}).get("source_date"))

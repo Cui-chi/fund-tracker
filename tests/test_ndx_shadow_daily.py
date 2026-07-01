@@ -5,11 +5,70 @@ from pathlib import Path
 from unittest import mock
 
 import ndx_shadow_run
+import fund_tracker
 from scripts import run_ndx_shadow_daily as daily
 
 
 TARGET = dt.date(2026, 6, 23)
 NOW = dt.datetime(2026, 6, 24, 13, 10, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+
+
+def canonical_copilot(run_id="run-test"):
+    return {
+        "run_id": run_id,
+        "generated_at": NOW.isoformat(),
+        "data_status": "WARNING",
+        "model_status": "UNDER_VALIDATION",
+        "validation_stage": "OFFLINE_PASS",
+        "activation_status": "NOT_ACTIVE",
+        "decision_status": "FREEZE",
+        "dynamic_cash_pool_status": "FREEZE",
+        "carrier_snapshot_id": "qdii-1",
+        "input_hashes": {},
+        "shadow_inputs": {
+            "portfolio_snapshot": {"source_date": NOW.isoformat(), "stale_status": "PASS"},
+            "target_snapshot": {"source_date": NOW.isoformat(), "stale_status": "PASS"},
+        },
+        "ndx_price_temperature": {
+            "price_primary_source": "FRED_NASDAQ100",
+            "source_date": TARGET.isoformat(),
+            "ndx_close": 30000.0,
+            "dfii10_source_date": TARGET.isoformat(),
+            "dfii10": 2.31,
+            "formula_version": ndx_shadow_run.MODEL_VERSION,
+            "no_lookahead_check": "PASS",
+            "temperature_score": 50.0,
+            "candidate_effective_release_factor": 0.25,
+            "base_release_factor": 0.25,
+            "real_yield_modifier": 1.0,
+            "volatility_cap": 1.0,
+        },
+        "v7_decision_chain": {
+            "model_candidate": {
+                "ndx_gap_routed_amount": 1000.0,
+                "ndx_candidate_release_amount": 250.0,
+            },
+            "carrier_matching": {
+                "carrier_snapshot_id": "qdii-1",
+                "carrier_snapshot_valid": True,
+                "carrier_selection_status": "AVAILABLE",
+                "carrier_coverable_amount": 250.0,
+                "retained_due_to_capacity": 0.0,
+                "retained_due_to_carrier_block": 0.0,
+                "current_effective_carrier_capacity": 1000.0,
+                "last_known_approved_carrier_capacity": 1000.0,
+            },
+            "formal_decision": {
+                "formal_executable_amount": 0.0,
+                "formal_release_amount": 0.0,
+                "retained_due_to_decision_freeze": 250.0,
+            },
+            "identity_verification": {
+                "candidate_to_carrier_reconciled": True,
+                "carrier_to_decision_reconciled": True,
+            },
+        },
+    }
 
 
 def check(ndx, dfii10, local_ndx=None, local_dfii10=None):
@@ -168,6 +227,79 @@ class NdxShadowDailyTests(unittest.TestCase):
                 self.assertEqual(payload["copilot"]["ndx_price_temperature"]["ndx_close"], 30000.0)
                 self.assertEqual(payload["copilot"]["prepared_snapshot_validation"]["macro_input_match"], True)
                 self.assertEqual(payload["copilot"]["ndx_data_layer"]["macro_inputs"][0]["value"], 2.31)
+
+    def test_execute_shadow_without_report_builds_minimal_prepared_snapshot(self):
+        accepted = {
+            "accepted_ndx": {
+                "ndx_source": "FRED_NASDAQ100",
+                "ndx_instrument": "NDX",
+                "ndx_source_date": TARGET.isoformat(),
+                "ndx_value": 30000.0,
+                "ndx_retrieved_at": NOW.isoformat(),
+                "ndx_accepted_as_of_date": TARGET.isoformat(),
+            },
+            "dfii10_source": "DFII10",
+            "dfii10_source_date": TARGET.isoformat(),
+            "dfii10_value": 2.31,
+            "dfii10_retrieved_at": NOW.isoformat(),
+            "dfii10_lag_trading_days": 0,
+            "dfii10_lag_status": "FRESH",
+            "dfii10_accepted_as_of_date": TARGET.isoformat(),
+        }
+        minimal = {"copilot": canonical_copilot("minimal-run")}
+        with tempfile.TemporaryDirectory() as temp:
+            prepared = Path(temp) / "prepared"
+            with mock.patch.object(daily, "latest_report_path", return_value=None), \
+                 mock.patch.object(daily, "build_minimal_shadow_report", return_value=minimal) as builder, \
+                 mock.patch.object(daily, "PREPARED_REPORT_ROOT", prepared), \
+                 mock.patch.object(daily.subprocess, "run") as runner:
+                runner.return_value = mock.Mock(returncode=0, stdout="")
+                result = daily.execute_shadow(TARGET, accepted_dfii10=accepted)
+        self.assertEqual(result, "SHADOW_EXECUTED")
+        builder.assert_called_once_with(TARGET, accepted)
+        runner.assert_called_once()
+
+    def test_no_report_without_accepted_inputs_remains_no_report(self):
+        with mock.patch.object(daily, "latest_report_path", return_value=None):
+            self.assertEqual(daily.execute_shadow(TARGET), "NO_REPORT")
+
+    def test_minimal_builder_injects_accepted_inputs_into_canonical_snapshot(self):
+        accepted = {
+            "accepted_ndx": {
+                "ndx_source": "FRED_NASDAQ100",
+                "ndx_instrument": "NDX",
+                "ndx_source_date": TARGET.isoformat(),
+                "ndx_value": 30000.0,
+                "ndx_retrieved_at": NOW.isoformat(),
+                "ndx_accepted_as_of_date": TARGET.isoformat(),
+            },
+            "dfii10_source": "DFII10",
+            "dfii10_source_date": TARGET.isoformat(),
+            "dfii10_value": 2.31,
+            "dfii10_retrieved_at": NOW.isoformat(),
+            "dfii10_lag_trading_days": 0,
+            "dfii10_lag_status": "FRESH",
+            "dfii10_accepted_as_of_date": TARGET.isoformat(),
+        }
+        snapshot = dict(canonical_copilot()["ndx_price_temperature"])
+        fake_conn = mock.Mock()
+        with mock.patch.object(daily, "latest_model_snapshot_with_accepted_inputs", return_value=snapshot), \
+             mock.patch.object(fund_tracker, "load_config", return_value={"funds": []}), \
+             mock.patch.object(fund_tracker, "connect_db", return_value=fake_conn), \
+             mock.patch.object(fund_tracker, "generate_market_temperature", return_value={}), \
+             mock.patch.object(fund_tracker, "generate_copilot_snapshot", return_value=canonical_copilot()), \
+             mock.patch.object(daily.qdii_carrier, "RAW_SNAPSHOT_PATH", Path("/tmp/nonexistent-qdii-raw.json")), \
+             mock.patch.object(daily.qdii_carrier, "CARRIER_JSON_PATH", Path("/tmp/nonexistent-qdii-latest.json")):
+            report = daily.build_minimal_shadow_report(TARGET, accepted)
+        canonical = ndx_shadow_run.canonical_shadow_view(report)
+        self.assertEqual(canonical["ndx_price_temperature"]["source_date"], TARGET.isoformat())
+        self.assertEqual(canonical["ndx_price_temperature"]["ndx_close"], 30000.0)
+        self.assertEqual(canonical["ndx_price_temperature"]["dfii10_source_date"], TARGET.isoformat())
+        self.assertEqual(canonical["ndx_price_temperature"]["dfii10"], 2.31)
+        self.assertEqual(report["copilot"]["prepared_snapshot_validation"]["status"], "PASS")
+        self.assertIsInstance(ndx_shadow_run.canonical_input_hash(canonical, TARGET, canonical["ndx_data_layer"]), str)
+        self.assertEqual(ndx_shadow_run.evaluate_primary_shadow_gate(canonical["ndx_data_layer"], TARGET)["decision"], "READY")
+        fake_conn.close.assert_called_once()
 
     def test_prepared_snapshot_atomic_write_produces_valid_json(self):
         payload = {
