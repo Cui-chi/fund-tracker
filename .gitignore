@@ -1,0 +1,32 @@
+# Python cache/runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local virtual/vendor runtimes
+.audit-runtime/
+.venv/
+venv/
+
+# IDE/editor local state
+.idea/
+.vscode/
+.DS_Store
+
+# Local configuration and data stores
+config.json
+data/
+*.sqlite
+*.sqlite3
+*.db
+
+# Generated reports and web exports
+reports/
+dist/
+html/
+json/
+logs/
+
+# Runtime locks/temp files
+*.lock
+*.tmp
