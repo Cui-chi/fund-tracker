@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 import cn_equity_temperature
+import fund_tracker
 import model_risk
 import ndx_price_temperature as ndx
 import qdii_carrier
@@ -158,10 +159,26 @@ class NdxValidationCloseoutTests(unittest.TestCase):
             self.assertIn(text, self.formal)
 
     def test_26_gap_locked(self):
-        self.assertIn("15,898", self.formal)
+        # 持仓可在「持仓管理」编辑，故海外权益缺口从当前 config 经同一管线推导，
+        # 不写死某个金额，编辑持仓不会误伤本回归。
+        config = fund_tracker.load_config()
+        conn = fund_tracker.connect_db()
+        try:
+            temperature = fund_tracker.generate_market_temperature(conn, config)
+            snapshot = fund_tracker.generate_copilot_snapshot(conn, config, temperature)
+        finally:
+            conn.close()
+        gap = snapshot["gaps"]["us_equity"]
+        self.assertIn(f"{gap:+,.0f}", self.formal)
 
     def test_27_historical_execution_locked(self):
-        self.assertIn("Historical Executed Amount: 625 元", self.formal)
+        # 「Historical Executed Amount」页头是当月状态，跨月会归零（新月份尚未执行），
+        # 属正常行为。已执行月份的历史事实按「执行流水不可变」保存在月度执行历史表里，
+        # 断言应锁定这条不变的历史记录，而不是会随月份变化的当月页头数字。
+        self.assertRegex(
+            self.formal,
+            r"<td>2026-06</td>\s*<td>[^<]*</td>\s*<td>625</td>",
+        )
 
     def test_28_a500_regression(self):
         self.assertTrue(cn_equity_temperature.LIVE_SCORING_ENABLED)

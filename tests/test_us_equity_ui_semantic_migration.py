@@ -72,7 +72,12 @@ class UsEquityUiSemanticMigrationTests(unittest.TestCase):
         self.assertIn("Current Decision: 0 元", self.html)
         self.assertIn("当前FREEZE，执行确认不可用", self.html)
         self.assertIn('disabled aria-disabled="true"', self.html)
-        self.assertIn("Historical Executed Amount: 625 元", self.html)
+        # 页头「Historical Executed Amount」是当月状态，跨月会归零；已执行月份的
+        # 历史事实按「执行流水不可变」锁定在月度执行历史表里，断言应指向那条记录。
+        self.assertRegex(
+            self.html,
+            r"<td>2026-06</td>\s*<td>[^<]*</td>\s*<td>625</td>",
+        )
 
     def test_manual_carrier_and_add_holding_features_are_removed(self):
         for forbidden in ("手动添加载体", "加入观察名单", "/api/qdii/carriers/manual",
@@ -88,7 +93,10 @@ class UsEquityUiSemanticMigrationTests(unittest.TestCase):
         self.assertEqual(self.config["copilot_v7"]["strategic_allocation"],
                          {"a_share": .4, "us_equity": .4, "gold": .1, "cash": .1})
         self.assertEqual(next(row for row in self.config["funds"] if row["code"] == "270023")["weekly_auto_invest"], 100.0)
-        self.assertIn("Historical Executed Amount: 625 元", self.html)
+        self.assertRegex(
+            self.html,
+            r"<td>2026-06</td>\s*<td>[^<]*</td>\s*<td>625</td>",
+        )
 
 
 if __name__ == "__main__":
