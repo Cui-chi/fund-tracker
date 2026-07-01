@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **重要：`fund_tracker/` 自己就是 git 仓库根目录**（`fund_tracker/.git`，远程 `git@github.com:Cui-chi/fund-tracker.git`），git 命令直接在 `fund_tracker/` 内运行即可，不需要跳到上一级。`../qdii-monitor/` 是同级的独立项目（外部维护、自己的仓库），本仓库只在文件系统层面只读它的快照文件，见下文 QDII 依赖；两者不是同一个 git 仓库，也不是 submodule 关系。
 
-> 历史遗留：`fund_tracker/` 所在的上一级目录 `New project/` 也存在一个本地 `.git`（无远程），曾经吸收过本项目源码的完整副本。那是历史遗留、非权威的本地仓库，**不要**再往那边提交本项目的改动；如遇到 git 操作行为反常（比如 `git status` 显示大量与本项目无关的改动），先确认当前在哪个 `.git` 下操作（`git rev-parse --show-toplevel`）。
+> 历史遗留（已归档）：`fund_tracker/` 所在的上一级目录 `New project/` 曾经存在一个本地 `.git`（无远程），吸收过本项目源码的完整副本。已确认非权威后，该 `.git` 已重命名为 `New project/.git.archived-2026-07-01-non-authoritative`（历史保留，未删除），`New project/` 现在不再是 git 仓库。如遇到 git 操作行为反常，先用 `git rev-parse --show-toplevel` 确认当前在哪个 `.git` 下操作。
 
 ## 常用命令
 

@@ -30,8 +30,9 @@ class ReportOutputTests(unittest.TestCase):
         self.assertIn("Current Decision: 0 元", text)
         self.assertIn("<tr><td>Release Amount</td><td>0 元</td></tr>", text)
         self.assertIn("Current Recommended Flow: 0 元", text)
-        self.assertIn("Historical Executed Amount: 625 元", text)
-        self.assertIn("Historical Executed Amount: 625 元", text)
+        # 「Historical Executed Amount」页头是当月状态，跨月会归零；已执行月份的
+        # 历史事实按「执行流水不可变」锁定在月度执行历史表里，断言应指向那条记录。
+        self.assertRegex(text, r"<td>2026-06</td>\s*<td>[^<]*</td>\s*<td>625</td>")
         self.assertIn("执行已禁用（FREEZE）", text)
         # A500 model is now ACTIVE (not blocked); PE/PB are display-only
         self.assertIn("估值数据当前仅供参考", text)

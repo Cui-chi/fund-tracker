@@ -544,13 +544,22 @@ def recompute_decision(snapshot):
             + components["a_share"]["liquidity_score"] * 0.30,
             1,
         )
-    scores = {
-        "a_share": a_share_score,
-        "us_equity": round(
+    # us_equity retired its valuation/liquidity scoring when NDX price-temperature
+    # took over (legacy_valuation_score/legacy_liquidity_score are kept only as
+    # None placeholders in current-format snapshots); older persisted snapshots
+    # still carry the retired valuation_score/liquidity_score fields directly.
+    if "ndx_price_temperature" in components["us_equity"]:
+        us_equity_temperature_score = components["us_equity"]["ndx_price_temperature"].get("temperature_score")
+        us_equity_score = round(us_equity_temperature_score, 1) if us_equity_temperature_score is not None else None
+    else:
+        us_equity_score = round(
             components["us_equity"]["valuation_score"] * 0.60
             + components["us_equity"]["liquidity_score"] * 0.40,
             1,
-        ),
+        )
+    scores = {
+        "a_share": a_share_score,
+        "us_equity": us_equity_score,
         "gold": components["gold"]["final_gold_score"],
     }
     strategic = snapshot["target_allocation_before_score_adjustment"]
@@ -580,7 +589,10 @@ def recompute_decision(snapshot):
         abs(routing["allocations"].get(asset, 0) - snapshot["asset_allocation_amounts"].get(asset, 0))
         for asset in ("a_share", "us_equity", "gold")
     ]
-    score_diffs = [abs(scores[asset] - snapshot["asset_scores"][asset]) for asset in scores]
+    score_diffs = [
+        abs((scores[asset] or 0) - (snapshot["asset_scores"].get(asset) or 0))
+        for asset in scores
+    ]
     return {
         "asset_scores": scores,
         "targets": targets,

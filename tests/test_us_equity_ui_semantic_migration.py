@@ -62,11 +62,24 @@ class UsEquityUiSemanticMigrationTests(unittest.TestCase):
         self.assertIn("待补齐", self.html)
 
     def test_transparent_tags_and_volatility_disclosure(self):
-        for label in ("已有持仓", "单只可覆盖", "跟踪误差最低", "综合费率", "规模待补齐"):
+        # 「单只可覆盖」是否出现，取决于当月 Dynamic Cash Pool 规模（随月度新增资金变化）
+        # 与外部 QDII 载体额度快照（独立于本仓库更新）两者的实时大小关系，两者都会随
+        # 时间独立漂移，不适合在渲染页面里断言某个标签必然/必不出现；改由下面的
+        # test_single_carrier_coverage_tag 对产出该标签的纯函数做受控输入验证。
+        for label in ("已有持仓", "跟踪误差最低", "综合费率", "规模待补齐"):
             self.assertIn(label, self.html)
         self.assertIn("50元与10000元之间反复切换", self.html)
         self.assertIn("底层指数高度重合", self.html)
         self.assertNotIn("Carrier Score", self.html)
+
+    def test_single_carrier_coverage_tag(self):
+        carriers = [
+            {"fund_code": "A", "ndx_pool_eligible": True, "effective_limit_rmb": 1000},
+            {"fund_code": "B", "ndx_pool_eligible": True, "effective_limit_rmb": 500},
+        ]
+        tags = qdii_carrier.transparent_tags(carriers, asset_amount=800)
+        self.assertIn("单只可覆盖", tags["A"]["advantages"])
+        self.assertNotIn("单只可覆盖", tags["B"]["advantages"])
 
     def test_freeze_and_execution_controls(self):
         self.assertIn("Current Decision: 0 元", self.html)
