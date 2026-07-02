@@ -182,6 +182,42 @@ class NdxShadowDailyTests(unittest.TestCase):
         self.assertEqual(patched["copilot"]["ndx_data_layer"]["macro_inputs"][0]["date"], TARGET.isoformat())
         self.assertEqual(patched["copilot"]["ndx_data_layer"]["macro_inputs"][0]["value"], 2.31)
 
+    def test_lagged_dfii10_is_mapped_to_target_month_for_model(self):
+        accepted_ndx = {
+            "ndx_source": "FRED_NASDAQ100",
+            "ndx_instrument": "NDX",
+            "ndx_source_date": "2026-07-01",
+            "ndx_value": 29809.13,
+        }
+        accepted = {
+            "dfii10_source": "DFII10",
+            "dfii10_source_date": "2026-06-30",
+            "dfii10_value": 2.20,
+            "dfii10_lag_trading_days": 1,
+            "dfii10_lag_status": "ACCEPTABLE_LAG",
+            "dfii10_accepted_as_of_date": "2026-06-30",
+        }
+        captured = {}
+        def fake_latest_snapshot(prices, monthly_rates):
+            captured["monthly_rates"] = monthly_rates
+            return {
+                "source_date": "2026-07-01",
+                "ndx_close": 29809.13,
+                "dfii10_source_date": "2026-06-30",
+                "dfii10": 2.20,
+                "dfii10_percentile": 80.0,
+                "real_yield_modifier": 0.85,
+                "candidate_effective_release_factor": 0.40,
+            }
+        with mock.patch.object(daily.ndx_price_temperature, "read_fred_csv", side_effect=[
+            [(dt.date(2026, 6, 30), 30276.35)],
+            [(dt.date(2026, 6, 30), 2.20)],
+        ]), mock.patch.object(daily.ndx_price_temperature, "latest_snapshot", side_effect=fake_latest_snapshot):
+            snapshot = daily.latest_model_snapshot_with_accepted_inputs(accepted_ndx, accepted)
+        self.assertEqual(captured["monthly_rates"]["2026-07"], {"value": 2.20, "source_date": "2026-06-30"})
+        self.assertEqual(snapshot["real_yield_modifier"], 0.85)
+        self.assertEqual(snapshot["candidate_effective_release_factor"], 0.40)
+
     def test_execute_shadow_writes_isolated_prepared_snapshot(self):
         accepted = {
             "accepted_ndx": {

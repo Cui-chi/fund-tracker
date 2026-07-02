@@ -273,10 +273,28 @@ def latest_model_snapshot_with_accepted_inputs(accepted_ndx, accepted_dfii10):
         rate_daily = [(date, value) for date, value in rate_daily if date != accepted_date]
         rate_daily.append((accepted_date, float(accepted_value)))
         rate_daily.sort(key=lambda item: item[0])
-    rates = ndx_price_temperature.daily_rates_to_monthly(rate_daily)
+    rates = target_date_effective_monthly_rates(
+        rate_daily, accepted_ndx_date, accepted_date, accepted_value
+    )
     snapshot = ndx_price_temperature.latest_snapshot(prices, rates)
     snapshot["price_primary_source"] = ndx_shadow_run.NDX_PRIMARY_SOURCE
     return snapshot
+
+
+def target_date_effective_monthly_rates(rate_daily, accepted_ndx_date, accepted_dfii10_date, accepted_dfii10_value):
+    """Return the model's target-date macro input view.
+
+    This is an in-memory overlay for the current target date only. It must not
+    be written back as a historical monthly DFII10 observation: the preserved
+    source_date remains the accepted DFII10 observation date.
+    """
+    rates = ndx_price_temperature.daily_rates_to_monthly(rate_daily)
+    if accepted_ndx_date and accepted_dfii10_date and accepted_dfii10_value is not None:
+        rates[accepted_ndx_date.strftime("%Y-%m")] = {
+            "value": float(accepted_dfii10_value),
+            "source_date": accepted_dfii10_date.isoformat(),
+        }
+    return rates
 
 
 def latest_model_snapshot_with_accepted_dfii10(accepted_dfii10):
