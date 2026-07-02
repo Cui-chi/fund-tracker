@@ -818,33 +818,119 @@ def _dominant_constraint(chain):
     return "NONE"
 
 
+def _numeric_comparison(current, prior):
+    result = {
+        "status": "COMPARABLE",
+        "current_value": current,
+        "prior_value": prior,
+        "delta": None,
+        "direction": None,
+    }
+    if current is None:
+        result["status"] = "CURRENT_VALUE_MISSING"
+        return result
+    if prior is None:
+        result["status"] = "PRIOR_VALUE_MISSING"
+        return result
+    if (isinstance(current, bool) or isinstance(prior, bool)
+            or not isinstance(current, (int, float))
+            or not isinstance(prior, (int, float))
+            or not math.isfinite(float(current))
+            or not math.isfinite(float(prior))):
+        result["status"] = "INVALID_VALUE_TYPE"
+        return result
+    delta = float(current) - float(prior)
+    result["current_value"] = float(current)
+    result["prior_value"] = float(prior)
+    result["delta"] = delta
+    result["direction"] = "UP" if delta > 0 else "DOWN" if delta < 0 else "FLAT"
+    return result
+
+
+def _comparison_delta(comparison):
+    return comparison["delta"] if comparison.get("status") == "COMPARABLE" else None
+
+
+def _comparison_warning(name, comparison):
+    status = comparison.get("status")
+    if status == "COMPARABLE":
+        return None
+    return {
+        "warning": "PRIOR_COMPARISON_SKIPPED",
+        "field": name,
+        "status": status,
+        "current_value": comparison.get("current_value"),
+        "prior_value": comparison.get("prior_value"),
+    }
+
+
 def compare_with_prior_day(prior, canonical, failures):
     """Prospective adjacent-day comparison; observations never change parameters."""
     if not prior:
         return None
     model = canonical["ndx_price_temperature"]
     chain = canonical["v7_decision_chain"]
-    candidate = float(chain["model_candidate"].get("ndx_candidate_release_amount") or 0)
-    capacity = float(chain["carrier_matching"].get("current_effective_carrier_capacity") or 0)
-    coverable = float(chain["carrier_matching"].get("carrier_coverable_amount") or 0)
-    prior_candidate = float(prior.get("ndx_candidate_release_amount") or 0)
-    prior_capacity = float(prior.get("current_effective_carrier_capacity") or 0)
-    candidate_pct = None if prior_candidate == 0 else (candidate - prior_candidate) / prior_candidate
-    capacity_pct = None if prior_capacity == 0 else (capacity - prior_capacity) / prior_capacity
+    candidate_comparison = _numeric_comparison(
+        chain["model_candidate"].get("ndx_candidate_release_amount"),
+        prior.get("ndx_candidate_release_amount"),
+    )
+    capacity_comparison = _numeric_comparison(
+        chain["carrier_matching"].get("current_effective_carrier_capacity"),
+        prior.get("current_effective_carrier_capacity"),
+    )
+    coverable_comparison = _numeric_comparison(
+        chain["carrier_matching"].get("carrier_coverable_amount"),
+        prior.get("carrier_coverable_amount"),
+    )
+    score_comparison = _numeric_comparison(
+        model.get("temperature_score"),
+        prior.get("temperature_score"),
+    )
+    release_factor_comparison = _numeric_comparison(
+        model.get("candidate_effective_release_factor"),
+        prior.get("candidate_effective_release_factor"),
+    )
+    candidate = candidate_comparison.get("current_value")
+    prior_candidate = candidate_comparison.get("prior_value")
+    capacity = capacity_comparison.get("current_value")
+    prior_capacity = capacity_comparison.get("prior_value")
+    candidate_pct = (
+        None if candidate_comparison.get("status") != "COMPARABLE" or prior_candidate == 0
+        else candidate_comparison["delta"] / prior_candidate
+    )
+    capacity_pct = (
+        None if capacity_comparison.get("status") != "COMPARABLE" or prior_capacity == 0
+        else capacity_comparison["delta"] / prior_capacity
+    )
+    warnings = [
+        item for item in (
+            _comparison_warning("temperature_score", score_comparison),
+            _comparison_warning("candidate_effective_release_factor", release_factor_comparison),
+            _comparison_warning("ndx_candidate_release_amount", candidate_comparison),
+            _comparison_warning("current_effective_carrier_capacity", capacity_comparison),
+            _comparison_warning("carrier_coverable_amount", coverable_comparison),
+        ) if item
+    ]
     comparison = {
-        "temperature_score_change": float(model["temperature_score"]) - float(prior["temperature_score"]),
-        "candidate_release_factor_change": float(model["candidate_effective_release_factor"]) - float(prior["candidate_effective_release_factor"]),
-        "candidate_amount_change": candidate - prior_candidate,
+        "temperature_score_comparison": score_comparison,
+        "candidate_release_factor_comparison": release_factor_comparison,
+        "candidate_amount_comparison": candidate_comparison,
+        "carrier_capacity_comparison": capacity_comparison,
+        "carrier_coverable_comparison": coverable_comparison,
+        "temperature_score_change": _comparison_delta(score_comparison),
+        "candidate_release_factor_change": _comparison_delta(release_factor_comparison),
+        "candidate_amount_change": _comparison_delta(candidate_comparison),
         "candidate_amount_change_pct": candidate_pct,
-        "carrier_capacity_change": capacity - prior_capacity,
+        "carrier_capacity_change": _comparison_delta(capacity_comparison),
         "carrier_capacity_change_pct": capacity_pct,
-        "carrier_coverable_change": coverable - float(prior.get("carrier_coverable_amount") or 0),
+        "carrier_coverable_change": _comparison_delta(coverable_comparison),
         "temperature_level_changed": model.get("temperature_level") != prior.get("temperature_level"),
         "dominant_constraint_changed": _dominant_constraint(chain) != prior.get("dominant_constraint"),
+        "comparison_warnings": warnings,
     }
     reasons = []
-    if abs(comparison["temperature_score_change"]) > 20: reasons.append("TEMPERATURE_SCORE_CHANGE_GT_20")
-    if abs(comparison["candidate_release_factor_change"]) > 0.20: reasons.append("RELEASE_FACTOR_CHANGE_GT_0_20")
+    if comparison["temperature_score_change"] is not None and abs(comparison["temperature_score_change"]) > 20: reasons.append("TEMPERATURE_SCORE_CHANGE_GT_20")
+    if comparison["candidate_release_factor_change"] is not None and abs(comparison["candidate_release_factor_change"]) > 0.20: reasons.append("RELEASE_FACTOR_CHANGE_GT_0_20")
     if candidate_pct is not None and abs(candidate_pct) > 0.50: reasons.append("CANDIDATE_AMOUNT_CHANGE_GT_50_PERCENT")
     if capacity_pct is not None and capacity_pct < -0.80: reasons.append("CARRIER_CAPACITY_DROP_GT_80_PERCENT")
     if failures: reasons.append("STATUS_PASS_TO_FAIL")

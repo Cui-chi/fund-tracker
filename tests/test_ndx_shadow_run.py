@@ -108,6 +108,14 @@ def mark_ledger_failed(path, failed_session="2026-06-22", run_id="failed-run"):
     return payload
 
 
+def mutate_ledger(path, mutator):
+    payload = shadow.load_ledger(path)
+    mutator(payload)
+    payload["ledger_sha256"] = shadow._ledger_hash(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
 def day0_report(root):
     report = canonical_report("2026-06-18", "day0")
     path = root / "day0.json"
@@ -274,6 +282,66 @@ class NdxShadowRunTests(unittest.TestCase):
             output=run_valid_day(r,ledger,"2026-06-23","run-day2")
             self.assertIn("adjacent_day_comparison",output)
             self.assertFalse(output["adjacent_day_comparison"]["shadow_anomaly"])
+
+    def test_39b_prior_comparison_statuses_are_null_safe(self):
+        c=shadow.canonical_shadow_view(canonical_report())
+        prior={"temperature_score":20.0,"candidate_effective_release_factor":0.30,
+               "ndx_candidate_release_amount":100.0,"current_effective_carrier_capacity":1000.0,
+               "carrier_coverable_amount":100.0,"temperature_level":"HOT","dominant_constraint":"DECISION_FREEZE"}
+        comparison=shadow.compare_with_prior_day(prior,c,[])
+        self.assertEqual(comparison["candidate_release_factor_comparison"]["status"],"COMPARABLE")
+        self.assertAlmostEqual(comparison["candidate_release_factor_comparison"]["delta"],0.053)
+        prior["candidate_effective_release_factor"]=None
+        comparison=shadow.compare_with_prior_day(prior,c,[])
+        self.assertEqual(comparison["candidate_release_factor_comparison"]["status"],"PRIOR_VALUE_MISSING")
+        self.assertIsNone(comparison["candidate_release_factor_change"])
+        c["ndx_price_temperature"]["candidate_effective_release_factor"]=None
+        comparison=shadow.compare_with_prior_day(prior,c,[])
+        self.assertEqual(comparison["candidate_release_factor_comparison"]["status"],"CURRENT_VALUE_MISSING")
+        del prior["candidate_effective_release_factor"]
+        c["ndx_price_temperature"]["candidate_effective_release_factor"]=0.353
+        comparison=shadow.compare_with_prior_day(prior,c,[])
+        self.assertEqual(comparison["candidate_release_factor_comparison"]["status"],"PRIOR_VALUE_MISSING")
+        c["ndx_price_temperature"].pop("candidate_effective_release_factor")
+        prior["candidate_effective_release_factor"]=0.30
+        comparison=shadow.compare_with_prior_day(prior,c,[])
+        self.assertEqual(comparison["candidate_release_factor_comparison"]["status"],"CURRENT_VALUE_MISSING")
+        c["ndx_price_temperature"]["candidate_effective_release_factor"]=0.353
+        prior["candidate_effective_release_factor"]="bad"
+        comparison=shadow.compare_with_prior_day(prior,c,[])
+        self.assertEqual(comparison["candidate_release_factor_comparison"]["status"],"INVALID_VALUE_TYPE")
+
+    def test_39c_prior_missing_release_factor_warns_but_runner_counts(self):
+        with tempfile.TemporaryDirectory() as t:
+            r=Path(t); ledger=r/"ledger.json"; shadow.initialize_ledger(day0_report(r),ledger)
+            run_valid_day(r,ledger,"2026-06-22","run-day1")
+            mutate_ledger(ledger, lambda payload: payload["days"][0].pop("candidate_effective_release_factor", None))
+            output=run_valid_day(r,ledger,"2026-06-23","run-day2")
+            final=shadow.load_ledger(ledger)
+            comparison=output["adjacent_day_comparison"]["candidate_release_factor_comparison"]
+            self.assertEqual(comparison["status"],"PRIOR_VALUE_MISSING")
+            self.assertIn("PRIOR_COMPARISON_SKIPPED", [w["warning"] for w in output["adjacent_day_comparison"]["comparison_warnings"]])
+            self.assertTrue(output["shadow_evaluation"]["day_gate_pass"])
+            self.assertEqual(final["shadow_days_completed"],2)
+
+    def test_39d_current_missing_release_factor_writes_failure_without_counting(self):
+        with tempfile.TemporaryDirectory() as t:
+            r=Path(t); ledger=r/"ledger.json"; shadow.initialize_ledger(day0_report(r),ledger)
+            run_valid_day(r,ledger,"2026-06-22","run-day1")
+            report,latest,raw=runnable_report(r,"2026-06-23","run-day2")
+            payload=json.loads(report.read_text())
+            payload["copilot"]["ndx_price_temperature"]["candidate_effective_release_factor"]=None
+            report.write_text(json.dumps(payload), encoding="utf-8")
+            output=shadow.run_shadow_session(report,ledger,r/"shadow",dt.date(2026,6,23),dt.datetime(2026,6,23,16,16,tzinfo=NY),latest,raw,True)
+            final=shadow.load_ledger(ledger)
+            self.assertFalse(output["shadow_evaluation"]["day_gate_pass"])
+            self.assertEqual(output["adjacent_day_comparison"]["candidate_release_factor_comparison"]["status"],"CURRENT_VALUE_MISSING")
+            self.assertTrue((r/"shadow"/"2026-06-23"/"shadow-run.json").is_file())
+            self.assertEqual(final["shadow_days_completed"],1)
+            self.assertEqual(final["status"],"SHADOW_FAILED")
+            self.assertEqual(final["decision_status"],"FREEZE")
+            self.assertEqual(final["dynamic_cash_pool_status"],"FREEZE")
+            self.assertEqual(final["days"][0]["formal_release_amount"],0.0)
 
     def test_40_stale_qdii_snapshot_fails_day(self):
         with tempfile.TemporaryDirectory() as t:
