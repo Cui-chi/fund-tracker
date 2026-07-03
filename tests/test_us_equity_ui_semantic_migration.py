@@ -49,9 +49,14 @@ class UsEquityUiSemanticMigrationTests(unittest.TestCase):
 
     def test_json_whitelist_and_i_class_semantics(self):
         self.assertTrue(all(row["approved"] for row in self.carriers))
+        # 结构性不变量：021000 是 I 类份额（不随外部快照的申购状态漂移）。
         i_class = next(row for row in self.carriers if row["fund_code"] == "021000")
-        self.assertTrue(i_class["personal_purchase_supported"])
-        self.assertIn("个人可买：是", self.html)
+        self.assertEqual(i_class["share_class"], "I")
+        # 「个人可买」是外部 qdii-monitor 快照的事实字段，会随快照变化；断言页面
+        # 忠实渲染该字段的当前值，而不是写死某个 是/否。
+        expected = "个人可买：%s" % ("是" if i_class["personal_purchase_supported"] else "否")
+        row_start = self.html.index('data-code="021000"')
+        self.assertIn(expected, self.html[row_start:row_start + 700])
 
     def test_multi_select_amounts_and_missing_fields_are_visible(self):
         self.assertGreater(self.html.count('class="qdii-select"'), 1)
