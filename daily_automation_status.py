@@ -268,6 +268,8 @@ STEP_OK = ("成功", GREEN)
 STEP_FAIL = ("失败", RED)
 STEP_SKIP = ("跳过", GRAY)
 STEP_WAIT = ("等待", YELLOW)
+STEP_BLOCKED = ("阻断", ORANGE)     # Runner 执行成功但账本闸门未计入（非系统崩溃）
+STEP_NOT_COUNTED = ("未计入", ORANGE)
 
 
 def carrier_gate(data_status, selection_status):
@@ -349,9 +351,18 @@ def execution_flow(sla_record, *, ledger_counted_today=False,
         carrier_gate_status = ("成功", GREEN, "载体数据可用")
     steps.append(_step("载体闸门", (carrier_gate_status[0], carrier_gate_status[1]),
                        carrier_gate_status[2] if len(carrier_gate_status) > 2 else ""))
-    steps.append(_step("账本记录", STEP_OK if ledger_counted_today else STEP_SKIP,
-                       "已计入当日" if ledger_counted_today else "未计入"))
-    steps.append(_step("毕业进度", STEP_OK if reached_execute else STEP_WAIT))
+    # 账本记录 / 毕业进度：严格区分「Runner 执行成功」与「账本计入成功」。
+    # SHADOW_EXECUTED 只代表 Runner 跑通并产出预备快照；当日是否计入毕业，由账本
+    # 自身的规范闸门决定（可能因字段不一致而拒绝计入）。不可因 Runner 成功就把毕业标绿。
+    if ledger_counted_today:
+        steps.append(_step("账本记录", STEP_OK, "已计入当日"))
+        steps.append(_step("毕业进度", STEP_OK, "毕业进度 +1 天"))
+    elif reached_execute:
+        steps.append(_step("账本记录", STEP_BLOCKED, "Runner 执行成功，但账本闸门未计入当日"))
+        steps.append(_step("毕业进度", STEP_NOT_COUNTED, "毕业进度未推进（已通过天数不倒退）"))
+    else:
+        steps.append(_step("账本记录", STEP_SKIP, "未产生可计入结果"))
+        steps.append(_step("毕业进度", STEP_WAIT))
     return steps
 
 
@@ -405,6 +416,11 @@ def root_cause_layers(sla_record, ledger):
     run_state = classify_final_status(final)
     ledger_state = classify_ledger_status((ledger or {}).get("status"))
 
+    # Runner 执行成功 ≠ 当日已计入毕业。只有目标交易日真正出现在账本 days 里，才算计入。
+    target = r.get("target_trade_date")
+    counted_dates = {d.get("market_session_date") for d in (ledger or {}).get("days", [])}
+    counted_today = bool(target) and target in counted_dates
+
     # 表面状态：用户第一眼可能看到的原始英文（账本 status 常最吓人）。
     surface = (ledger or {}).get("status") or final or "无数据"
 
@@ -430,7 +446,12 @@ def root_cause_layers(sla_record, ledger):
     latest_fail = ((ledger or {}).get("failures") or [None])[-1]
     root_parts = []
     if run_state["key"] == "EXECUTED":
-        root_parts.append("系统运行正常，当日已成功计入毕业进度。")
+        if counted_today:
+            root_parts.append("系统运行正常，当日已成功计入毕业进度。")
+        else:
+            root_parts.append(
+                "Runner 执行成功，但账本闸门未将当日计入毕业进度，"
+                "毕业进度本次未推进（已通过的天数不会倒退）。")
     elif run_state["is_anomaly"] and run_state["key"] == "SYSTEM_ERROR":
         root_parts.append("确为系统异常，需人工排查。")
     elif run_state["key"] in ("WAIT_DATA", "MARKET_LIMIT", "WAIT_SESSION"):

@@ -105,6 +105,19 @@ class DailyAutomationStatusTests(unittest.TestCase):
         self.assertEqual(by_name["账本记录"]["status"], "成功")
         self.assertEqual(by_name["宏观利率输入"]["status"], "成功")
 
+    def test_execution_flow_executed_but_not_counted_does_not_greenlight_graduation(self):
+        # SHADOW_EXECUTED（Runner 成功）但账本未计入当日：毕业进度不得标绿。
+        record = {"target_trade_date": "2026-07-02", "fred_ndx_date": "2026-07-02",
+                  "local_ndx_date": "2026-07-02", "dfii10_lag_status": "ACCEPTABLE_LAG",
+                  "final_status": "SHADOW_EXECUTED"}
+        by_name = {s["name"]: s for s in das.execution_flow(record, ledger_counted_today=False)}
+        self.assertEqual(by_name["账本记录"]["status"], "阻断")
+        self.assertEqual(by_name["毕业进度"]["status"], "未计入")
+        self.assertNotEqual(by_name["毕业进度"]["status"], "成功")
+        # 而真正计入时才标绿
+        counted = {s["name"]: s for s in das.execution_flow(record, ledger_counted_today=True)}
+        self.assertEqual(counted["毕业进度"]["status"], "成功")
+
     def test_execution_flow_not_ready_waits_not_fails(self):
         record = {"target_trade_date": "2026-07-02", "fred_ndx_date": "2026-07-01",
                   "local_ndx_date": "2026-07-01", "dfii10_lag_status": "NOT_READY",
@@ -133,13 +146,23 @@ class DailyAutomationStatusTests(unittest.TestCase):
             {"status": "DAY1_PASS"})
         self.assertIn("并非系统故障", layers["root"])
 
-    def test_root_cause_explains_shadow_failed_is_gate_rejection(self):
+    def test_root_cause_executed_but_not_counted_is_not_contradictory(self):
+        # 07-02: Runner 成功但未计入（不在 days，账本 SHADOW_FAILED）。
         layers = das.root_cause_layers(
             {"final_status": "SHADOW_EXECUTED", "target_trade_date": "2026-07-02"},
-            {"status": "SHADOW_FAILED",
+            {"status": "SHADOW_FAILED", "days": [{"market_session_date": "2026-06-30"}],
              "failures": [{"failures": [{"root_cause": "archived QDII input hash differs"}]}]})
         self.assertEqual(layers["surface"], "SHADOW_FAILED")
         self.assertIn("不会倒退", layers["root"])
+        self.assertIn("未推进", layers["root"])
+        # 不得再声称「已成功计入」——那是与 SHADOW_FAILED 自相矛盾的旧 bug。
+        self.assertNotIn("已成功计入", layers["root"])
+
+    def test_root_cause_executed_and_counted_says_counted(self):
+        layers = das.root_cause_layers(
+            {"final_status": "SHADOW_EXECUTED", "target_trade_date": "2026-06-30"},
+            {"status": "DAY1_PASS", "days": [{"market_session_date": "2026-06-30", "shadow_day": 1}]})
+        self.assertIn("已成功计入", layers["root"])
 
 
     # ── Automation History + Execution Coverage ──
