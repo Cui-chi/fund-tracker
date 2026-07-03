@@ -12,7 +12,14 @@ Cash Pool。
 设计原则（对应 spec）：
 - 状态具有唯一含义，不把所有异常都归类为「系统异常」。
 - 正常的「等待 / 市场限制」（黄/灰）与真正的「系统异常」（红）严格区分。
+- 本项目是本地项目，电脑不保证每天开机：严格区分「电脑离线（未运行）」「非交易日」
+  「自动化未部署」与真正的「系统执行失败」，且**绝不自动补跑/补造历史**——历史表只
+  忠实展示已有产物，缺失日期就如实显示为电脑离线/未部署。
 """
+
+import datetime as dt
+
+import ndx_shadow_run
 
 # ── 语义颜色 token（渲染层再映射到具体 CSS 类，模块本身不含 CSS） ──
 GREEN = "green"    # 成功 / 通过
@@ -126,6 +133,35 @@ STATES = {
         "trigger": "决策/资金池处于 FREEZE（默认设计使然，模型未激活前不动钱）",
         "is_anomaly": False, "needs_manual": False,
         "affects_graduation": False, "affects_dcp": True,
+    },
+    # ── 本地环境维度（区分「没运行」与「运行失败」）──
+    "NON_TRADING": {
+        "label": "非交易日",
+        "color": GRAY,
+        "trigger": "周末或美股节假日，无新交易日，本就无需执行",
+        "is_anomaly": False, "needs_manual": False,
+        "affects_graduation": False, "affects_dcp": False,
+    },
+    "OFFLINE": {
+        "label": "电脑离线",
+        "color": GRAY,
+        "trigger": "交易日当天没有任何运行记录（多为本地电脑未开机 / LaunchAgent 未运行）",
+        "is_anomaly": False, "needs_manual": False,   # 环境问题，非程序错误
+        "affects_graduation": False, "affects_dcp": False,
+    },
+    "NOT_DEPLOYED": {
+        "label": "未部署",
+        "color": GRAY,
+        "trigger": "该交易日早于自动化上线，系统当时尚不存在，不计入覆盖率",
+        "is_anomaly": False, "needs_manual": False,
+        "affects_graduation": False, "affects_dcp": False,
+    },
+    "PENDING": {
+        "label": "待运行",
+        "color": BLUE,
+        "trigger": "美股交易日尚未收盘或未到运行时点，稍后自动执行",
+        "is_anomaly": False, "needs_manual": False,
+        "affects_graduation": False, "affects_dcp": False,
     },
     "UNKNOWN": {
         "label": "未知状态",
@@ -417,4 +453,100 @@ def root_cause_layers(sla_record, ledger):
         "surface_state": ledger_state,
         "direct": direct,
         "root": " ".join(root_parts) or "暂无进一步归因。",
+    }
+
+
+# ── Automation History + Execution Coverage ──
+# 严格区分：非交易日 / 未部署（上线前）/ 电脑离线（有交易日却无运行记录）/ 已运行。
+# 只读已有 SLA/账本产物，按日历日如实分类，绝不自动补跑或补造历史。
+WEEKDAYS_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+_HISTORY_ROOT_CAUSE = {
+    "SHADOW_EXECUTED": "执行成功",
+    "ALREADY_COMPLETED": "已计入，跳过重复",
+    "NOT_READY": "等待数据（市场未发布）",
+    "AS_OF_MISMATCH": "市场数据未对齐",
+    "NO_COMPLETE_SESSION": "无完整交易日",
+    "MODEL_SNAPSHOT_NOT_READY": "预备快照未就绪",
+    "NO_REPORT": "预备快照未就绪",
+    "LOCAL_REFRESH_FAILED": "本地数据刷新失败",
+}
+
+
+def _history_root_cause(final_status):
+    return _HISTORY_ROOT_CAUSE.get(final_status, "运行结果：%s" % (final_status or "—"))
+
+
+def _classify_history_day(date, sla_by_date, counted, fail_dates, deploy_start, latest_complete_session):
+    iso = date.isoformat()
+    row = {
+        "date": iso, "weekday": WEEKDAYS_CN[date.weekday()],
+        "is_trading_day": ndx_shadow_run.is_nasdaq_session(date),
+        "shadow": "—", "graduation": "—", "dcp": "—",
+    }
+    if not row["is_trading_day"]:
+        row.update(category="non_trading", state=state("NON_TRADING"),
+                   root_cause="周末" if date.weekday() >= 5 else "美股节假日")
+        return row
+    if deploy_start and date < deploy_start:
+        row.update(category="not_deployed", state=state("NOT_DEPLOYED"), root_cause="自动化尚未上线")
+        return row
+    if latest_complete_session and date > latest_complete_session:
+        row.update(category="pending", state=state("PENDING"), root_cause="尚未到运行时点")
+        return row
+    rec = sla_by_date.get(iso)
+    if rec:
+        st = classify_final_status(rec.get("final_status"))
+        if iso in counted:
+            grad = "计入 Day %s" % counted[iso]
+        elif iso in fail_dates:
+            grad = "未计入"
+        else:
+            grad = "—"
+        row.update(category="ran", state=st, shadow=st["label"],
+                   root_cause=_history_root_cause(rec.get("final_status")),
+                   graduation=grad, dcp="策略冻结")
+        return row
+    # 交易日、在部署窗口内、已到运行时点，却没有记录 → 电脑离线（非程序错误）
+    row.update(category="offline", state=state("OFFLINE"),
+               root_cause="当日无运行记录（多为电脑关机）")
+    return row
+
+
+def build_automation_history(sla_records, ledger, *, latest_complete_session,
+                             deploy_start=None, today=None, window_days=30):
+    """按日历日（most-recent-first）分类最近 window_days 天的自动化历史。
+
+    latest_complete_session / deploy_start / today 均为 datetime.date（或 None）。
+    deploy_start 缺省取 SLA 记录中最早的 target_trade_date（自动化上线日）。
+    """
+    today = today or dt.date.today()
+    sla_by_date = {r.get("target_trade_date"): r for r in (sla_records or []) if r.get("target_trade_date")}
+    if deploy_start is None and sla_by_date:
+        deploy_start = min(dt.date.fromisoformat(d) for d in sla_by_date)
+    counted = {d.get("market_session_date"): d.get("shadow_day") for d in (ledger or {}).get("days", [])}
+    fail_dates = {f.get("market_session_date") for f in (ledger or {}).get("failures", [])}
+    return [
+        _classify_history_day(today - dt.timedelta(days=offset), sla_by_date, counted,
+                              fail_dates, deploy_start, latest_complete_session)
+        for offset in range(window_days)
+    ]
+
+
+def execution_coverage(rows):
+    """在「已部署且已到运行时点的交易日」范围内统计执行覆盖率。
+
+    应执行 = 该范围交易日数（已运行 + 电脑离线）；实际执行 = 已运行（有记录，含等待数据）；
+    缺失 = 电脑离线的交易日。未部署 / 非交易日 / 待运行均不计入分母。
+    """
+    due = [r for r in rows if r["category"] in ("ran", "offline")]
+    ran = [r for r in due if r["category"] == "ran"]
+    missing = sorted(r["date"] for r in rows if r["category"] == "offline")
+    should = len(due)
+    actual = len(ran)
+    return {
+        "should": should,
+        "actual": actual,
+        "rate": round(actual / should * 100, 1) if should else 0.0,
+        "missing_days": missing,
     }

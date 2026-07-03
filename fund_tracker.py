@@ -5398,6 +5398,83 @@ def render_daily_automation_html(copilot):
             % html.escape(str(exc)))
 
 
+def _latest_complete_session(now):
+    """日历上最近一个「已收盘」的美股交易日（用于判断哪些交易日已到运行时点）。"""
+    ny_date = now.astimezone(ndx_shadow_run.NEW_YORK).date()
+    for offset in range(10):
+        candidate = ny_date - dt.timedelta(days=offset)
+        if ndx_shadow_run.market_session_status(candidate, evaluated_at=now).get("complete_us_trading_day"):
+            return candidate
+    return None
+
+
+def render_automation_history_html(copilot):
+    """「自动化历史」Tab：执行覆盖率 + 最近 30 个日历日的自动化历史表。
+
+    只读 SLA/账本产物 + 交易日历，按日历日如实分类；严格区分 非交易日 / 未部署 /
+    电脑离线 / 已运行，**绝不自动补跑或补造历史**。读取失败降级为占位面板。
+    """
+    das = daily_automation_status
+    try:
+        ledger = _load_json_safe(_SHADOW_DIR / "shadow-ledger.json", {})
+        sla = _load_json_safe(_SHADOW_DIR / "source-sla.json", {})
+        records = sla.get("records", []) if isinstance(sla, dict) else []
+        now = dt.datetime.now().astimezone()
+        rows = das.build_automation_history(
+            records, ledger, latest_complete_session=_latest_complete_session(now),
+            today=now.date(), window_days=30)
+        cov = das.execution_coverage(rows)
+
+        missing_txt = ("、".join(cov["missing_days"]) if cov["missing_days"]
+                       else '<span style="color:var(--green);">无</span>')
+        rate_color = "green" if cov["rate"] >= 95 else ("yellow" if cov["rate"] >= 80 else "orange")
+        coverage_panel = f"""
+        <article class="panel das-hero das-border-{rate_color}">
+          <span class="eyebrow">Execution Coverage · 执行覆盖率</span>
+          <h2>已部署交易日执行覆盖率 <span class="das-{rate_color}">{cov['rate']:.1f}%</span></h2>
+          <div class="das-summary">
+            <div class="das-cell"><span class="das-k">应执行（交易日）</span><span class="das-v">{cov['should']} 天</span></div>
+            <div class="das-cell"><span class="das-k">实际执行（跑过）</span><span class="das-v">{cov['actual']} 天</span></div>
+            <div class="das-cell"><span class="das-k">覆盖率</span><span class="das-v das-{rate_color}">{cov['rate']:.1f}%</span></div>
+            <div class="das-cell"><span class="das-k">缺失（电脑离线）</span><span class="das-v">{len(cov['missing_days'])} 天</span></div>
+          </div>
+          <div class="das-oneline"><strong>缺失交易日：</strong>{missing_txt}
+          <span class="muted"> · 统计仅含「已部署且已到运行时点」的交易日；上线前=未部署、周末节假日=非交易日，均不计入分母。</span></div>
+        </article>"""
+
+        hist_rows = ""
+        for r in rows:
+            trading = ('<span class="das-green">是</span>' if r["is_trading_day"]
+                       else '<span class="das-gray">否</span>')
+            hist_rows += (
+                "<tr>"
+                f"<td>{html.escape(r['date'])}<small>{html.escape(r['weekday'])}</small></td>"
+                f"<td>{trading}</td>"
+                f"<td>{html.escape(r['shadow'])}</td>"
+                f"<td>{_das_pill(r['state'], small=True)}</td>"
+                f"<td>{html.escape(r['root_cause'])}</td>"
+                f"<td>{html.escape(str(r['graduation']))}</td>"
+                f"<td>{html.escape(str(r['dcp']))}</td>"
+                "</tr>")
+        table_panel = f"""
+        <article class="panel section-spacer">
+          <span class="eyebrow">Automation History · 自动化历史</span>
+          <h2>最近 30 个日历日（真实记录，不自动补历史）</h2>
+          <div style="overflow-x:auto;"><table class="das-history">
+            <thead><tr><th>日期</th><th>交易日</th><th>Shadow</th><th>最终状态</th><th>Root Cause</th><th>Graduation</th><th>资金池</th></tr></thead>
+            <tbody>{hist_rows}</tbody>
+          </table></div>
+          <p class="muted">「电脑离线」= 交易日当天本地无运行记录（多为电脑关机），属环境问题、非程序错误；系统不会用当前数据补造昨天的结果。</p>
+        </article>"""
+        return coverage_panel + table_panel
+    except Exception as exc:
+        return (
+            '<article class="panel"><span class="eyebrow">自动化历史</span>'
+            '<h2>暂无自动化历史</h2>'
+            '<p class="muted">尚未产生运行记录，或读取失败：%s</p></article>'
+            % html.escape(str(exc)))
+
+
 def write_copilot_dashboard(
     rows,
     macro_rows,
@@ -6543,6 +6620,7 @@ def write_copilot_dashboard(
         </article>
     """
     daily_automation_html = render_daily_automation_html(copilot)
+    automation_history_html = render_automation_history_html(copilot)
 
     qdii_health_html = f"""
         <article class="panel section-spacer">
@@ -7333,6 +7411,9 @@ def write_copilot_dashboard(
     .das-rc-layer .das-k {{ margin-bottom:0; }}
     .das-rc-root {{ background:#fff; border:1px solid var(--line); }}
     .das-rc-arrow {{ text-align:center; color:var(--subtle); font-size:16px; padding:5px 0; }}
+    .das-history td {{ font-size:12px; padding:9px 10px; }}
+    .das-history td small {{ color:var(--subtle); font-size:10px; margin-left:6px; }}
+    .das-history tbody tr:hover {{ background:var(--paper); }}
 
     @media (max-width:800px) {{
       .das-summary {{ grid-template-columns:1fr 1fr; }}
@@ -7368,6 +7449,7 @@ def write_copilot_dashboard(
     <nav class="tab-nav" role="tablist">
       <button class="tab-btn active" role="tab" aria-selected="true" data-tab="overview">总览</button>
       <button class="tab-btn" role="tab" aria-selected="false" data-tab="daily-automation">每日自动化</button>
+      <button class="tab-btn" role="tab" aria-selected="false" data-tab="automation-history">自动化历史</button>
       <button class="tab-btn" role="tab" aria-selected="false" data-tab="portfolio">持仓管理</button>
       <button class="tab-btn" role="tab" aria-selected="false" data-tab="drawdown">基金回撤</button>
       <button class="tab-btn" role="tab" aria-selected="false" data-tab="allocation-flow">配置与资金流</button>
@@ -7650,6 +7732,10 @@ def write_copilot_dashboard(
         {daily_automation_html}
       </section>
 
+      <section class="tab-panel" role="tabpanel" id="tab-automation-history">
+        {automation_history_html}
+      </section>
+
       <section class="tab-panel" role="tabpanel" id="tab-history">
         <article class="panel">
           <span class="eyebrow">Monthly History</span>
@@ -7673,7 +7759,7 @@ def write_copilot_dashboard(
     (function() {{
       var tabButtons = document.querySelectorAll('.tab-btn');
       var tabPanels = {{}};
-      ['overview','daily-automation','portfolio','drawdown','allocation-flow','data-audit','history'].forEach(function(id) {{
+      ['overview','daily-automation','automation-history','portfolio','drawdown','allocation-flow','data-audit','history'].forEach(function(id) {{
         var el = document.getElementById('tab-' + id);
         if (el) tabPanels[id] = el;
       }});
