@@ -26,6 +26,7 @@ import cn_equity_temperature
 import ndx_price_temperature
 import ndx_shadow_run
 import qdii_carrier
+import daily_automation_status
 from utils import output_paths
 
 
@@ -5195,6 +5196,208 @@ def asset_label(asset):
     }.get(asset, asset)
 
 
+# ── 「每日自动化」监控页（Daily Automation Monitor）——纯展示，读治理产物，不改逻辑 ──
+_SHADOW_DIR = output_paths.REPORTS_ROOT / "shadow" / "ndx-v1"
+
+
+def _load_json_safe(path, default):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+def _latest_prepared_status(target_date):
+    """读目标交易日的预备快照校验状态（PASS / CRITICAL_FAIL / None），best-effort。"""
+    if not target_date:
+        return None
+    day_dir = _SHADOW_DIR / "prepared" / target_date
+    if not day_dir.is_dir():
+        return None
+    files = sorted(day_dir.glob("*canonical-shadow-report.json"))
+    if not files:
+        return None
+    payload = _load_json_safe(files[-1], {})
+    return payload.get("copilot", {}).get("prepared_snapshot_validation", {}).get("status")
+
+
+def _das_pill(state, small=False):
+    cls = "das-pill das-%s%s" % (state.get("color", "gray"), " das-sm" if small else "")
+    return '<span class="%s">%s</span>' % (cls, html.escape(str(state.get("label", "-"))))
+
+
+def render_daily_automation_html(copilot):
+    """构建「每日自动化」Tab 的 HTML。全部中文状态，读账本/SLA/预备快照/载体。
+
+    纯展示与分类：不修改 Shadow 核心业务流程 / Graduation / Ledger / 自动执行逻辑。
+    任何读取失败都降级为占位面板，绝不影响 dashboard 其它部分。
+    """
+    das = daily_automation_status
+    try:
+        ledger = _load_json_safe(_SHADOW_DIR / "shadow-ledger.json", {})
+        sla = _load_json_safe(_SHADOW_DIR / "source-sla.json", {})
+        records = sla.get("records", []) if isinstance(sla, dict) else []
+        latest = records[-1] if records else None
+
+        required = int(ledger.get("required_complete_days", ndx_shadow_run.REQUIRED_COMPLETE_DAYS) or 0)
+        completed = int(ledger.get("shadow_days_completed", 0) or 0)
+        target_date = (latest or {}).get("target_trade_date")
+        counted_dates = {d.get("market_session_date") for d in ledger.get("days", [])}
+        counted_today = target_date in counted_dates
+
+        qdii = copilot.get("qdii_carrier_integration", {}) or {}
+        carriers = (qdii.get("selection", {}) or {}).get("ndx_carriers", []) or []
+        gate = das.carrier_gate(qdii.get("carrier_data_status"), qdii.get("carrier_selection_status"))
+        carrier_ok = gate[0] == "成功"
+
+        run_state = das.classify_final_status((latest or {}).get("final_status"))
+        ledger_state = das.classify_ledger_status(ledger.get("status"))
+        dcp_state = das.classify_dcp_status(ledger.get("dynamic_cash_pool_status") or "FREEZE")
+        prepared_status = _latest_prepared_status(target_date)
+        flow = das.execution_flow(latest, ledger_counted_today=counted_today,
+                                  prepared_status=prepared_status, carrier_gate_status=gate)
+        cells = das.graduation_cells(ledger)
+        rc = das.root_cause_layers(latest, ledger)
+
+        generated = html.escape(str(copilot.get("generated_at", ""))[:16])
+        target_txt = html.escape(str(target_date or "—"))
+
+        # ── 1. 执行总览 ──
+        overview = f"""
+        <article class="panel das-hero das-border-{run_state['color']}">
+          <span class="eyebrow">每日自动化 · 执行总览</span>
+          <h2>今日结论：{html.escape(run_state['label'])}</h2>
+          <div class="das-summary">
+            <div class="das-cell"><span class="das-k">生成时间</span><span class="das-v">{generated}</span></div>
+            <div class="das-cell"><span class="das-k">目标交易日</span><span class="das-v">{target_txt}</span></div>
+            <div class="das-cell"><span class="das-k">Shadow 执行</span><span class="das-v">{_das_pill(run_state, small=True)}</span></div>
+            <div class="das-cell"><span class="das-k">Graduation 进度</span><span class="das-v">{completed} / {required} 天 · {_das_pill(ledger_state, small=True)}</span></div>
+            <div class="das-cell"><span class="das-k">动态资金池</span><span class="das-v">{_das_pill(dcp_state, small=True)}</span></div>
+          </div>
+          <div class="das-oneline"><strong>真实 Root Cause：</strong>{html.escape(rc['root'])}</div>
+        </article>"""
+
+        # ── 2. 执行流程 ──
+        step_html = ""
+        for i, s in enumerate(flow):
+            if i:
+                step_html += '<span class="das-arrow" aria-hidden="true">→</span>'
+            detail = ('<small>%s</small>' % html.escape(s['detail'])) if s.get('detail') else ''
+            step_html += (
+                '<span class="das-step">'
+                '<span class="das-dot das-bg-%s"></span>'
+                '<span class="das-step-name">%s</span>'
+                '<span class="das-step-status das-%s">%s</span>%s</span>'
+                % (s['color'], html.escape(s['name']), s['color'], html.escape(s['status']), detail))
+        flow_panel = f"""
+        <article class="panel section-spacer">
+          <span class="eyebrow">执行流程</span>
+          <h2>LaunchAgent → 毕业进度</h2>
+          <div class="das-flow">{step_html}</div>
+        </article>"""
+
+        # ── 3. Carrier 载体状态 ──
+        carrier_rows = ""
+        for c in carriers:
+            d = das.carrier_display(c)
+            held = '<span class="das-pill das-blue das-sm">已持仓</span>' if d["held"] else ''
+            carrier_rows += (
+                "<tr>"
+                f"<td>{html.escape(d['code'])}<small>{html.escape(d['name'])}</small></td>"
+                f"<td>{html.escape(d['purchase_status'])}</td>"
+                f'<td><span class="das-{d["channel_color"]}">{html.escape(d["channel_text"])}</span></td>'
+                f'<td><span class="das-{d["personal_color"]}">{html.escape(d["personal_text"])}</span></td>'
+                f"<td>{d['capacity']:,.0f} 元</td>"
+                f'<td><span class="das-pill das-{d["result_color"]} das-sm">{html.escape(d["result"])}</span> {held}</td>'
+                "</tr>")
+        carrier_panel = f"""
+        <article class="panel section-spacer">
+          <span class="eyebrow">Carrier 载体状态</span>
+          <h2>QDII 执行载体（{len(carriers)} 只）<small style="font-size:11px;color:var(--muted);"> 载体闸门：{html.escape(gate[2])}</small></h2>
+          <div style="overflow-x:auto;"><table>
+            <thead><tr><th>名称</th><th>申购状态</th><th>渠道可买</th><th>个人可买</th><th>容量</th><th>最终结果</th></tr></thead>
+            <tbody>{carrier_rows or '<tr><td colspan="6" class="muted">暂无载体数据</td></tr>'}</tbody>
+          </table></div>
+          <p class="muted">仅展示载体执行能力，不构成买入建议；系统不自动替用户决定。</p>
+        </article>"""
+
+        # ── 4. Graduation Progress ──
+        day_html = ""
+        for idx in range(1, required + 1):
+            cell = next((c for c in cells if c.get("shadow_day") == idx), None)
+            if cell:
+                day_html += (
+                    f'<div class="das-day das-border-{cell["color"]}">'
+                    f'<span class="das-day-n">Day {idx}</span>'
+                    f'<span class="das-pill das-{cell["color"]} das-sm">{html.escape(cell["label"])}</span>'
+                    f'<small>{html.escape(str(cell.get("date") or ""))}</small></div>')
+            else:
+                day_html += (
+                    f'<div class="das-day das-border-gray">'
+                    f'<span class="das-day-n">Day {idx}</span>'
+                    f'<span class="das-pill das-gray das-sm">等待</span>'
+                    f'<small>未到</small></div>')
+        # 未计入的失败尝试单独列出（不占用 Day 序号，避免让用户以为进度倒退）
+        fail_html = ""
+        for c in cells:
+            if c.get("shadow_day") is None:
+                fail_html += (
+                    f'<li class="das-fail"><span class="das-pill das-{c["color"]} das-sm">{html.escape(c["label"])}</span>'
+                    f' <span class="muted">{html.escape(str(c.get("date") or ""))}</span> · {html.escape(c.get("detail") or "")}</li>')
+        fail_block = (f'<h3 style="margin-top:14px;font-size:12px;color:var(--muted);">未计入的尝试（进度不倒退）</h3>'
+                      f'<ul class="das-fail-list">{fail_html}</ul>') if fail_html else ""
+        grad_panel = f"""
+        <article class="panel section-spacer">
+          <span class="eyebrow">Graduation Progress</span>
+          <h2>影子验证进度 {completed} / {required} 天</h2>
+          <div class="das-days">{day_html}</div>
+          {fail_block}
+        </article>"""
+
+        # ── 5. Root Cause 分层 ──
+        rc_panel = f"""
+        <article class="panel section-spacer">
+          <span class="eyebrow">Root Cause 分层归因</span>
+          <h2>看穿「看似坏了，其实只是市场限制」</h2>
+          <div class="das-rc">
+            <div class="das-rc-layer"><span class="das-k">表面状态</span><strong>{html.escape(str(rc['surface']))}</strong> {_das_pill(rc['surface_state'], small=True)}</div>
+            <div class="das-rc-arrow">↓</div>
+            <div class="das-rc-layer"><span class="das-k">直接原因</span><strong>{html.escape(rc['direct'])}</strong></div>
+            <div class="das-rc-arrow">↓</div>
+            <div class="das-rc-layer das-rc-root das-border-{run_state['color']}"><span class="das-k">真实 Root Cause</span><strong>{html.escape(rc['root'])}</strong></div>
+          </div>
+        </article>"""
+
+        # ── 状态说明表（折叠，供参考） ──
+        legend_rows = ""
+        for spec in das.STATES.values():
+            legend_rows += (
+                "<tr>"
+                f'<td>{_das_pill(spec, small=True)}</td>'
+                f"<td>{html.escape(spec['trigger'])}</td>"
+                f"<td>{'是' if spec['is_anomaly'] else '否'}</td>"
+                f"<td>{'是' if spec['needs_manual'] else '否'}</td>"
+                f"<td>{'是' if spec['affects_graduation'] else '否'}</td>"
+                f"<td>{'是' if spec['affects_dcp'] else '否'}</td>"
+                "</tr>")
+        legend = f"""
+        <details class="panel section-spacer">
+          <summary><strong>状态说明表</strong>（统一中文状态 · 触发条件 · 是否异常 · 是否需人工 · 是否影响 Graduation / DCP）</summary>
+          <div style="overflow-x:auto;margin-top:10px;"><table>
+            <thead><tr><th>状态</th><th>触发条件</th><th>异常</th><th>需人工</th><th>影响Graduation</th><th>影响DCP</th></tr></thead>
+            <tbody>{legend_rows}</tbody>
+          </table></div>
+        </details>"""
+
+        return overview + flow_panel + carrier_panel + grad_panel + rc_panel + legend
+    except Exception as exc:  # 展示层绝不拖垮主 dashboard
+        return (
+            '<article class="panel"><span class="eyebrow">每日自动化</span>'
+            '<h2>暂无每日自动化数据</h2>'
+            '<p class="muted">尚未产生影子运行记录，或读取失败：%s</p></article>'
+            % html.escape(str(exc)))
+
+
 def write_copilot_dashboard(
     rows,
     macro_rows,
@@ -6339,6 +6542,8 @@ def write_copilot_dashboard(
           </tbody></table>
         </article>
     """
+    daily_automation_html = render_daily_automation_html(copilot)
+
     qdii_health_html = f"""
         <article class="panel section-spacer">
           <span class="eyebrow">QDII Carrier Data Health</span>
@@ -7084,7 +7289,54 @@ def write_copilot_dashboard(
       transition:opacity .2s, transform .2s; z-index:40; }}
     .pm-toast.show {{ opacity:1; transform:translateX(-50%) translateY(0); }}
 
+    /* ===== Daily Automation Monitor（每日自动化）===== */
+    /* 语义颜色：绿=成功 蓝=进行中/冻结 黄=等待/市场限制 橙=数据/输入异常 红=系统异常 灰=未开始/跳过 */
+    .das-green {{ color:#1f7a57; }} .das-blue {{ color:#2b65d9; }} .das-yellow {{ color:#a35b00; }}
+    .das-orange {{ color:#c2410c; }} .das-red {{ color:#b42318; }} .das-gray {{ color:#667085; }}
+    .das-bg-green {{ background:#1f7a57; }} .das-bg-blue {{ background:#2b65d9; }} .das-bg-yellow {{ background:#d19100; }}
+    .das-bg-orange {{ background:#ea580c; }} .das-bg-red {{ background:#b42318; }} .das-bg-gray {{ background:#98a2b3; }}
+    .das-pill {{ display:inline-flex; align-items:center; padding:4px 11px; border-radius:999px; font-size:13px; font-weight:750; }}
+    .das-pill.das-sm {{ padding:2px 9px; font-size:11px; }}
+    .das-pill.das-green {{ background:#e6f4ed; color:#1f7a57; }}
+    .das-pill.das-blue {{ background:#edf4ff; color:#244a85; }}
+    .das-pill.das-yellow {{ background:#fff0d8; color:#a35b00; }}
+    .das-pill.das-orange {{ background:#ffedd5; color:#c2410c; }}
+    .das-pill.das-red {{ background:#fef2f0; color:#b42318; }}
+    .das-pill.das-gray {{ background:#f1f5f9; color:#667085; }}
+    .das-border-green {{ border-left:5px solid #1f7a57; }} .das-border-blue {{ border-left:5px solid #2b65d9; }}
+    .das-border-yellow {{ border-left:5px solid #d19100; }} .das-border-orange {{ border-left:5px solid #ea580c; }}
+    .das-border-red {{ border-left:5px solid #b42318; }} .das-border-gray {{ border-left:5px solid #cbd2dc; }}
+    .das-hero {{ margin-bottom:14px; }}
+    .das-summary {{ display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin:16px 0; }}
+    .das-cell {{ background:var(--paper); border-radius:10px; padding:12px 14px; }}
+    .das-k {{ display:block; font-size:11px; color:var(--muted); margin-bottom:5px; }}
+    .das-v {{ font-size:15px; font-weight:700; }}
+    .das-oneline {{ background:var(--paper); border-radius:10px; padding:13px 16px; font-size:13px; line-height:1.6; }}
+    .das-flow {{ display:flex; flex-wrap:wrap; align-items:flex-start; gap:6px; margin-top:12px; }}
+    .das-step {{ display:flex; flex-direction:column; align-items:center; text-align:center; min-width:82px; gap:3px; }}
+    .das-dot {{ width:12px; height:12px; border-radius:999px; }}
+    .das-step-name {{ font-size:12px; font-weight:650; }}
+    .das-step-status {{ font-size:11px; font-weight:750; }}
+    .das-step small {{ font-size:9px; color:var(--muted); line-height:1.2; max-width:96px; }}
+    .das-arrow {{ color:var(--subtle); font-size:14px; padding-top:2px; }}
+    .das-days {{ display:grid; grid-template-columns:repeat(5,1fr); gap:10px; margin-top:12px; }}
+    .das-day {{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 10px;
+      display:flex; flex-direction:column; align-items:center; gap:6px; box-shadow:0 4px 14px rgba(23,32,51,.03); }}
+    .das-day-n {{ font-size:13px; font-weight:750; }}
+    .das-day small {{ font-size:10px; color:var(--muted); }}
+    .das-fail-list {{ list-style:none; margin:8px 0 0; padding:0; }}
+    .das-fail {{ padding:7px 0; border-bottom:1px solid #f0f2f5; font-size:12px; }}
+    .das-fail:last-child {{ border-bottom:0; }}
+    .das-rc {{ margin-top:12px; }}
+    .das-rc-layer {{ background:var(--paper); border-radius:10px; padding:12px 16px; font-size:13px; line-height:1.55; }}
+    .das-rc-layer strong {{ display:block; margin-top:3px; font-size:14px; }}
+    .das-rc-layer .das-k {{ margin-bottom:0; }}
+    .das-rc-root {{ background:#fff; border:1px solid var(--line); }}
+    .das-rc-arrow {{ text-align:center; color:var(--subtle); font-size:16px; padding:5px 0; }}
+
     @media (max-width:800px) {{
+      .das-summary {{ grid-template-columns:1fr 1fr; }}
+      .das-days {{ grid-template-columns:1fr 1fr; }}
       .header-inner {{ padding:20px 18px 15px; }}
       main {{ padding:18px; }}
       .asset-cards {{ grid-template-columns:1fr; }}
@@ -7115,6 +7367,7 @@ def write_copilot_dashboard(
 
     <nav class="tab-nav" role="tablist">
       <button class="tab-btn active" role="tab" aria-selected="true" data-tab="overview">总览</button>
+      <button class="tab-btn" role="tab" aria-selected="false" data-tab="daily-automation">每日自动化</button>
       <button class="tab-btn" role="tab" aria-selected="false" data-tab="portfolio">持仓管理</button>
       <button class="tab-btn" role="tab" aria-selected="false" data-tab="drawdown">基金回撤</button>
       <button class="tab-btn" role="tab" aria-selected="false" data-tab="allocation-flow">配置与资金流</button>
@@ -7393,6 +7646,10 @@ def write_copilot_dashboard(
 
       </section>
 
+      <section class="tab-panel" role="tabpanel" id="tab-daily-automation">
+        {daily_automation_html}
+      </section>
+
       <section class="tab-panel" role="tabpanel" id="tab-history">
         <article class="panel">
           <span class="eyebrow">Monthly History</span>
@@ -7416,7 +7673,7 @@ def write_copilot_dashboard(
     (function() {{
       var tabButtons = document.querySelectorAll('.tab-btn');
       var tabPanels = {{}};
-      ['overview','portfolio','drawdown','allocation-flow','data-audit','history'].forEach(function(id) {{
+      ['overview','daily-automation','portfolio','drawdown','allocation-flow','data-audit','history'].forEach(function(id) {{
         var el = document.getElementById('tab-' + id);
         if (el) tabPanels[id] = el;
       }});
