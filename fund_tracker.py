@@ -200,6 +200,12 @@ def connect_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # 常驻的 local_server 守护进程与定时任务（09:10 日更 / 13:10 影子刷新）会并发访问
+    # 同一个 SQLite 文件。默认 busy_timeout=0 会在撞锁时立刻抛 "database is locked"
+    # （曾导致 13:10 影子成功后的 dashboard 刷新失败）。WAL 让读不阻塞写，busy_timeout
+    # 让写者最多等 30 秒而非立即失败。二者只影响并发健壮性，不改任何业务逻辑。
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS funds (
             code TEXT PRIMARY KEY,
@@ -5267,6 +5273,7 @@ def render_daily_automation_html(copilot):
         <article class="panel das-hero das-border-{run_state['color']}">
           <span class="eyebrow">每日自动化 · 执行总览</span>
           <h2>今日结论：{html.escape(run_state['label'])}</h2>
+          <p class="das-freshness">数据截止 {generated} · 本页为服务端快照、<strong>非实时</strong>；在每日 09:10 与影子运行成功后自动刷新，查看最新请重载浏览器。</p>
           <div class="das-summary">
             <div class="das-cell"><span class="das-k">生成时间</span><span class="das-v">{generated}</span></div>
             <div class="das-cell"><span class="das-k">目标交易日</span><span class="das-v">{target_txt}</span></div>
@@ -7385,6 +7392,8 @@ def write_copilot_dashboard(
     .das-border-yellow {{ border-left:5px solid #d19100; }} .das-border-orange {{ border-left:5px solid #ea580c; }}
     .das-border-red {{ border-left:5px solid #b42318; }} .das-border-gray {{ border-left:5px solid #cbd2dc; }}
     .das-hero {{ margin-bottom:14px; }}
+    .das-freshness {{ margin:6px 0 0; font-size:12px; color:var(--muted); line-height:1.5; }}
+    .das-freshness strong {{ color:var(--amber); }}
     .das-summary {{ display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin:16px 0; }}
     .das-cell {{ background:var(--paper); border-radius:10px; padding:12px 14px; }}
     .das-k {{ display:block; font-size:11px; color:var(--muted); margin-bottom:5px; }}
