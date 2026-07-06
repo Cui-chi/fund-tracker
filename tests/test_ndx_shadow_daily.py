@@ -261,8 +261,8 @@ class NdxShadowDailyTests(unittest.TestCase):
             prepared = Path(temp) / "prepared"
             with mock.patch.object(daily, "latest_model_snapshot_with_accepted_inputs", return_value=snapshot), \
                  mock.patch.object(daily, "PREPARED_REPORT_ROOT", prepared), \
-                mock.patch.object(daily.subprocess, "run") as runner:
-                runner.return_value = mock.Mock(returncode=0, stdout="")
+                mock.patch.object(daily.subprocess, "Popen") as runner:
+                runner.return_value = mock.Mock(returncode=0, communicate=mock.Mock(return_value=("", None)))
                 result = daily.execute_shadow(TARGET, report_path=report_path, accepted_dfii10=accepted)
                 self.assertEqual(result, "SHADOW_EXECUTED")
                 files = list(prepared.glob("%s/*canonical-shadow-report.json" % TARGET.isoformat()))
@@ -297,8 +297,8 @@ class NdxShadowDailyTests(unittest.TestCase):
             with mock.patch.object(daily, "latest_report_path", return_value=None), \
                  mock.patch.object(daily, "build_minimal_shadow_report", return_value=minimal) as builder, \
                  mock.patch.object(daily, "PREPARED_REPORT_ROOT", prepared), \
-                 mock.patch.object(daily.subprocess, "run") as runner:
-                runner.return_value = mock.Mock(returncode=0, stdout="")
+                 mock.patch.object(daily.subprocess, "Popen") as runner:
+                runner.return_value = mock.Mock(returncode=0, communicate=mock.Mock(return_value=("", None)))
                 result = daily.execute_shadow(TARGET, accepted_dfii10=accepted)
         self.assertEqual(result, "SHADOW_EXECUTED")
         builder.assert_called_once_with(TARGET, accepted)
@@ -323,6 +323,23 @@ class NdxShadowDailyTests(unittest.TestCase):
             "dfii10_accepted_as_of_date": TARGET.isoformat(),
         }
 
+    def test_execute_shadow_timeout_kills_process_group(self):
+        accepted = self._accepted_inputs()
+        minimal = {"copilot": canonical_copilot("minimal-run")}
+        proc = mock.Mock(pid=4321, returncode=-9)
+        proc.communicate.side_effect = daily.subprocess.TimeoutExpired(cmd="x", timeout=900)
+        with tempfile.TemporaryDirectory() as temp:
+            prepared = Path(temp) / "prepared"
+            with mock.patch.object(daily, "latest_report_path", return_value=None), \
+                 mock.patch.object(daily, "build_minimal_shadow_report", return_value=minimal), \
+                 mock.patch.object(daily, "PREPARED_REPORT_ROOT", prepared), \
+                 mock.patch.object(daily.subprocess, "Popen", return_value=proc), \
+                 mock.patch.object(daily.os, "getpgid", return_value=4321), \
+                 mock.patch.object(daily.os, "killpg") as killpg:
+                with self.assertRaises(daily.DailyShadowError):
+                    daily.execute_shadow(TARGET, accepted_dfii10=accepted)
+        killpg.assert_called_once_with(4321, daily.signal.SIGKILL)
+
     def _run_fallback_case(self, temp, model, accepted):
         report_path = Path(temp) / "report.json"
         report_path.write_text(
@@ -333,8 +350,8 @@ class NdxShadowDailyTests(unittest.TestCase):
         prepared = Path(temp) / "prepared"
         with mock.patch.object(daily, "build_minimal_shadow_report", return_value=minimal) as builder, \
              mock.patch.object(daily, "PREPARED_REPORT_ROOT", prepared), \
-             mock.patch.object(daily.subprocess, "run") as runner:
-            runner.return_value = mock.Mock(returncode=0, stdout="")
+             mock.patch.object(daily.subprocess, "Popen") as runner:
+            runner.return_value = mock.Mock(returncode=0, communicate=mock.Mock(return_value=("", None)))
             result = daily.execute_shadow(TARGET, report_path=report_path, accepted_dfii10=accepted)
         builder.assert_called_once_with(TARGET, accepted)
         files = list(prepared.glob("%s/*canonical-shadow-report.json" % TARGET.isoformat()))

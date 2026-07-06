@@ -15,6 +15,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -560,9 +561,28 @@ def execute_shadow(target_date, report_path=None, accepted_dfii10=None):
         "--report", str(run_report),
         "--browser-verified",
     ]
-    completed = subprocess.run(command, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=900)
-    if completed.returncode:
-        raise DailyShadowError(completed.stdout.strip() or "shadow runner failed")
+    # start_new_session=True 让子进程成为独立进程组组长；若子进程又派生了孙子进程
+    # （curl 等）持有 stdout 管道，单纯 subprocess.run 的超时只杀直接子进程，父进程
+    # 仍会因管道未关而挂住超过 timeout（曾观察到 25 分钟不退）。这里超时时 kill 整个
+    # 进程组，保证父进程一定能退出。happy path 行为不变（同命令、同输出、同返回码）。
+    proc = subprocess.Popen(
+        command, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True, start_new_session=True,
+    )
+    try:
+        stdout, _ = proc.communicate(timeout=900)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        raise DailyShadowError("shadow runner timed out after 900s (killed process group)")
+    if proc.returncode:
+        raise DailyShadowError((stdout or "").strip() or "shadow runner failed")
     return "SHADOW_EXECUTED"
 
 
