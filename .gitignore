@@ -11,6 +11,7 @@ venv/
 # IDE/editor local state
 .idea/
 .vscode/
+.claude/
 .DS_Store
 
 # Local configuration and data stores
