@@ -642,14 +642,6 @@ def run_once(now=None, sleep_until_retry=True, sla_path=SLA_PATH, shadow_executo
             except TypeError:
                 final_status = shadow_executor(target)
             shadow_executed = final_status == "SHADOW_EXECUTED"
-            if shadow_executed:
-                # Best-effort only: a dashboard resync failure must never
-                # undo an already-recorded shadow success or its ledger entry.
-                try:
-                    dashboard_refresher()
-                    dashboard_refreshed = True
-                except Exception as exc:
-                    dashboard_refresh_error = str(exc)
     record = {
         "target_trade_date": target.isoformat(),
         "first_check_at": first_at,
@@ -669,7 +661,21 @@ def run_once(now=None, sleep_until_retry=True, sla_path=SLA_PATH, shadow_executo
         "dashboard_refreshed": dashboard_refreshed,
         "dashboard_refresh_error": dashboard_refresh_error,
     }
+    # Persist the SLA record BEFORE the dashboard resync so the rebuilt
+    # Automation History includes this run. Otherwise the resync renders the
+    # history before this record exists and the just-run session shows as
+    # 电脑离线 (inconsistent with Graduation Progress, which reads the ledger
+    # the runner already wrote) until the next rebuild.
     upsert_sla_record(record, sla_path)
+    if shadow_executed:
+        # Best-effort only: a resync failure must never undo the recorded
+        # shadow success or its ledger entry.
+        try:
+            dashboard_refresher()
+            record["dashboard_refreshed"] = True
+        except Exception as exc:
+            record["dashboard_refresh_error"] = str(exc)
+        upsert_sla_record(record, sla_path)
     return record
 
 

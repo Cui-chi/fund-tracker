@@ -550,6 +550,29 @@ class NdxShadowDailyTests(unittest.TestCase):
         load_cfg.assert_called_once_with()
         rebuild.assert_called_once_with({"fake": "config"}, phase="ndx-shadow-sync")
 
+    def test_sla_record_persisted_before_dashboard_refresh(self):
+        # Regression: the just-run session must already be in source-sla.json
+        # when the dashboard resync fires, otherwise the rebuilt Automation
+        # History renders that session as 电脑离线 (inconsistent with the ledger).
+        import json
+        captured = {}
+        with tempfile.TemporaryDirectory() as temp:
+            sla = Path(temp) / "source-sla.json"
+            def refresher():
+                data = json.loads(sla.read_text()) if sla.exists() else {"records": []}
+                captured["targets"] = [r["target_trade_date"] for r in data["records"]]
+            def refresh_ok(target_date, accepted_dfii10=None):
+                acc = dt.date.fromisoformat(accepted_dfii10["dfii10_source_date"]) if accepted_dfii10 else TARGET
+                return True, TARGET, acc
+            with mock.patch.object(daily, "latest_complete_us_session", return_value=TARGET), \
+                 mock.patch.object(daily, "ledger_has_completed_day", return_value=False), \
+                 mock.patch.object(daily, "precheck", side_effect=[check(TARGET, TARGET)]), \
+                 mock.patch.object(daily, "refresh_and_validate", side_effect=refresh_ok):
+                daily.run_once(now=NOW, sleep_until_retry=False, sla_path=sla,
+                               shadow_executor=mock.Mock(return_value="SHADOW_EXECUTED"),
+                               dashboard_refresher=refresher)
+        self.assertIn(TARGET.isoformat(), captured.get("targets", []))
+
 
 if __name__ == "__main__":
     unittest.main()
