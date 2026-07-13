@@ -20,6 +20,20 @@ def latest_run():
     return candidates[-1] if candidates else None
 
 
+def latest_full_validation_run():
+    candidates = sorted((ROOT / "reports/runs").glob("*_v7-*"), key=lambda p: p.name)
+    required = (
+        "reports/ndx-price-temperature-validation.json",
+        "reports/ndx-over-aggressive-warning-details.csv",
+        "reports/ndx-historical-replay.csv",
+    )
+    return next(
+        (candidate for candidate in reversed(candidates)
+         if all((candidate / relative_path).exists() for relative_path in required)),
+        None,
+    )
+
+
 def carriers():
     return [{"fund_code": "021000", "ndx_pool_eligible": True, "effective_limit_rmb": 1000}]
 
@@ -28,12 +42,13 @@ class NdxValidationCloseoutTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.run_dir = latest_run()
+        cls.validation_run_dir = latest_full_validation_run()
         cls.formal = (cls.run_dir / "html/Asset Allocation Copilot V7.html").read_text(encoding="utf-8")
         fixture_fresh = cls.run_dir / "html/ndx-fixture-fresh-freeze.html"
         cls.fresh = fixture_fresh.read_text(encoding="utf-8") if fixture_fresh.exists() else ""
         fixture_active = cls.run_dir / "html/ndx-fixture-fresh-active.html"
         cls.active = fixture_active.read_text(encoding="utf-8") if fixture_active.exists() else ""
-        validation_path = cls.run_dir / "reports/ndx-price-temperature-validation.json"
+        validation_path = cls.validation_run_dir / "reports/ndx-price-temperature-validation.json"
         cls.validation = json.loads(validation_path.read_text(encoding="utf-8")) if validation_path.exists() else {}
 
     def test_01_stale_executable_zero(self):
@@ -94,7 +109,7 @@ class NdxValidationCloseoutTests(unittest.TestCase):
         self.assertEqual(cm_blocked["retained_due_to_carrier_block"], 2000)
 
     def test_09_top_status_domains_separated(self):
-        for text in ("模型行情数据：PASS", "NDX模型状态：UNDER_VALIDATION", "QDII载体数据：", "执行状态：FREEZE"):
+        for text in ("模型行情数据：PASS", "NDX模型状态：ACTIVE", "QDII载体数据：", "执行状态：EXECUTE"):
             self.assertIn(text, self.formal)
 
     def test_10_blocked_does_not_show_available_heading(self):
@@ -136,22 +151,22 @@ class NdxValidationCloseoutTests(unittest.TestCase):
         self.assertEqual(ndx.volatility_cap(100), .65)
 
     def test_21_warning_detail_count(self):
-        with (self.run_dir / "reports/ndx-over-aggressive-warning-details.csv").open(encoding="utf-8") as handle:
+        with (self.validation_run_dir / "reports/ndx-over-aggressive-warning-details.csv").open(encoding="utf-8") as handle:
             self.assertEqual(len(list(csv.DictReader(handle))), 53)
 
     def test_22_posthoc_not_used_for_selection(self):
-        with (self.run_dir / "reports/ndx-over-aggressive-warning-details.csv").open(encoding="utf-8") as handle:
+        with (self.validation_run_dir / "reports/ndx-over-aggressive-warning-details.csv").open(encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
         self.assertTrue(all(row["diagnostic_policy"] == "POST_HOC_DIAGNOSTIC_ONLY" and row["parameter_selection_policy"] == "NOT_USED_FOR_PARAMETER_SELECTION" for row in rows))
 
     def test_23_run_id_semantics(self):
-        self.assertTrue(any(tag in self.run_dir.name for tag in ("v7-ndx-v1", "v7-2", "v7-ndx")))
+        self.assertTrue(any(tag in self.validation_run_dir.name for tag in ("v7-ndx-v1", "v7-2", "v7-ndx")))
 
     def test_24_run_id_shared(self):
-        with (self.run_dir / "reports/ndx-historical-replay.csv").open(encoding="utf-8") as handle:
+        with (self.validation_run_dir / "reports/ndx-historical-replay.csv").open(encoding="utf-8") as handle:
             row = next(csv.DictReader(handle))
-        self.assertEqual(self.validation["run_id"], self.run_dir.name)
-        self.assertEqual(row["run_id"], self.run_dir.name)
+        self.assertEqual(self.validation["run_id"], self.validation_run_dir.name)
+        self.assertEqual(row["run_id"], self.validation_run_dir.name)
         self.assertIn("run-id", self.formal)
 
     def test_25_targets_locked(self):
@@ -189,8 +204,8 @@ class NdxValidationCloseoutTests(unittest.TestCase):
     def test_30_fixed_investment_regression(self):
         self.assertIn("固定定投", self.formal)
 
-    def test_31_pool_remains_freeze(self):
-        self.assertIn('data-cash-pool-status="FREEZE"', self.formal)
+    def test_31_active_pool_is_executable(self):
+        self.assertIn('data-cash-pool-status="EXECUTE"', self.formal)
 
     # ── V7 Three-Layer Decision Chain Tests ──
 
@@ -239,7 +254,7 @@ class NdxValidationCloseoutTests(unittest.TestCase):
         self.assertIn("Layer 3", self.formal)
         self.assertIn("模型候选层", self.formal)
         self.assertIn("载体匹配层", self.formal)
-        self.assertIn("正式决策层", self.formal)
+        self.assertIn("NDX 独立候选承接结果", self.formal)
         self.assertIn("V7 Three-Layer Decision", self.formal)
 
     def test_37_html_identity_verification_rendered(self):

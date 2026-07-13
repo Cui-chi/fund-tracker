@@ -77,6 +77,64 @@ def load_ndx_validation_snapshot():
         "formal_release_amount": 0.0,
         "data_status": "FAIL",
     }
+
+
+def load_ndx_shadow_lifecycle():
+    shadow_ledger_path = output_paths.REPORTS_ROOT / "shadow" / "ndx-v1" / "shadow-ledger.json"
+    fallback = {
+        "status": "DAY1_PENDING",
+        "shadow_days_completed": 0,
+        "required_complete_days": ndx_shadow_run.REQUIRED_COMPLETE_DAYS,
+        "activation_status": "NOT_ACTIVE",
+        "model_status": "UNDER_VALIDATION",
+        "validation_stage": "OFFLINE_VALIDATION",
+        "decision_status": "FREEZE",
+        "dynamic_cash_pool_status": "FREEZE",
+        "first_activation_guard": False,
+    }
+    if not shadow_ledger_path.is_file():
+        return fallback
+    try:
+        ledger = ndx_shadow_run.load_ledger(shadow_ledger_path)
+    except (OSError, ValueError, ndx_shadow_run.ShadowRunError):
+        fallback["status"] = "SHADOW_FAILED"
+        return fallback
+    return ledger
+
+
+def ndx_activation_gate_status(shadow_ledger):
+    """Return the lifecycle gate used before a live NDX decision can open."""
+    required = int(shadow_ledger.get("required_complete_days", ndx_shadow_run.REQUIRED_COMPLETE_DAYS) or 0)
+    completed = int(shadow_ledger.get("shadow_days_completed", 0) or 0)
+    shadow_complete = (
+        shadow_ledger.get("status") == "SHADOW_COMPLETE"
+        and completed >= required
+    )
+    activation_active = shadow_complete and shadow_ledger.get("activation_status") == "ACTIVE"
+    guard_pending = (
+        bool(shadow_ledger.get("first_activation_guard"))
+        or shadow_ledger.get("first_activation_guard_status") == "PENDING_MANUAL_CONFIRMATION"
+    )
+    if not activation_active:
+        return {
+            "activation_active": False,
+            "first_activation_confirmation_required": False,
+            "allow_formal_decision": False,
+            "blocking_reason": "NDX_SHADOW_VALIDATION_NOT_ACTIVATED",
+        }
+    if guard_pending:
+        return {
+            "activation_active": True,
+            "first_activation_confirmation_required": True,
+            "allow_formal_decision": False,
+            "blocking_reason": "NDX_FIRST_ACTIVATION_CONFIRMATION_REQUIRED",
+        }
+    return {
+        "activation_active": True,
+        "first_activation_confirmation_required": False,
+        "allow_formal_decision": True,
+        "blocking_reason": None,
+    }
 PE_METRIC_TYPES = {"trailing_pe", "forward_pe", "cape", "unknown"}
 PE_HISTORY_MONTHS = 60
 US_PE_WINDOW_LABEL = "recent_5y_percentile"
@@ -110,6 +168,7 @@ MACRO_SERIES = {
 }
 DEFAULT_COPILOT_CONFIG = {
     "monthly_contribution": 2500,
+    "approved_i_class_carriers": [],
     "execution_funds": {
         "a_share": "022459",
         "us_equity": "016452",
@@ -200,9 +259,9 @@ def connect_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    # 常驻的 local_server 守护进程与定时任务（09:10 日更 / 13:10 影子刷新）会并发访问
+    # 常驻的 local_server 守护进程与 09:10 日更任务会并发访问
     # 同一个 SQLite 文件。默认 busy_timeout=0 会在撞锁时立刻抛 "database is locked"
-    # （曾导致 13:10 影子成功后的 dashboard 刷新失败）。WAL 让读不阻塞写，busy_timeout
+    # 同一个数据库。WAL 让读不阻塞写，busy_timeout
     # 让写者最多等 30 秒而非立即失败。二者只影响并发健壮性，不改任何业务逻辑。
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA journal_mode = WAL")
@@ -645,6 +704,10 @@ def copilot_config(config):
     for key in ("monthly_contribution",):
         if key in configured:
             merged[key] = configured[key]
+    if isinstance(configured.get("approved_i_class_carriers"), list):
+        merged["approved_i_class_carriers"] = [
+            str(code) for code in configured["approved_i_class_carriers"]
+        ]
     for key in (
         "release_rules",
         "execution_funds",
@@ -3234,8 +3297,9 @@ def generate_copilot_snapshot(conn, config, market_temperature,
         cap_hit = raw_target >= max_target and final_target >= max_target
         if is_carry_forward:
             target_reason = (
-                "长期战略目标为 %.1f%%。旧PE模型已退役、新NDX模型尚未激活，"
-                "当前沿用上一有效决策快照的 %.1f%% 目标（target_mode=CARRY_FORWARD_LAST_VALID_TARGET）。"
+                "长期战略目标为 %.1f%%。NDX V1已完成Shadow验证并激活，"
+                "但目标仓位从上一有效 %.1f%% 切换至战略目标仍需单独确认；"
+                "当前继续沿用上一有效目标（target_mode=CARRY_FORWARD_LAST_VALID_TARGET）。"
                 % (strategic_target * 100, final_target * 100)
             )
         elif floor_hit:
@@ -3367,17 +3431,44 @@ def generate_copilot_snapshot(conn, config, market_temperature,
             "warning_issues": [reason_code],
             "reason": f"A500价格温度模型未启用（{reason_code}）；战略缺口回退继续可用",
         }
-    data_quality_gate["asset_level_status"]["us_equity"] = {
-        "data_quality_status": "PASS" if ndx_model.get("data_status") == "PASS" else "WARNING",
-        "execution_status": "BLOCKED",
-        "blocking_issues": [
-            "NDX_PRICE_TEMPERATURE_UNDER_VALIDATION",
-            "NDX_OFFLINE_GATE_NOT_PASSED" if not ndx_model.get("offline_pass") else "NDX_SHADOW_3_TRADING_DAYS_NOT_COMPLETED",
-        ],
-        "warning_issues": [],
-        "reason": "NDX价格温度离线验证链已实现，但离线门或连续交易日验证尚未完成；当前不产生正式释放。",
-    }
-    complete = False
+    shadow_ledger = load_ndx_shadow_lifecycle()
+    activation_gate = ndx_activation_gate_status(shadow_ledger)
+    shadow_complete = activation_gate["activation_active"]
+    activation_status = shadow_ledger.get("activation_status", "NOT_ACTIVE")
+    ndx_activation_active = activation_gate["activation_active"]
+    ndx_model = dict(ndx_model)
+    ndx_model["model_status"] = "ACTIVE" if ndx_activation_active else "UNDER_VALIDATION"
+    ndx_model["activation_status"] = activation_status
+    ndx_model["ready_for_manual_activation"] = bool(
+        shadow_complete and shadow_ledger.get("ready_for_manual_activation_review")
+    )
+    ndx_model["shadow_status"] = shadow_ledger.get("status", "DAY1_PENDING")
+    ndx_model["shadow_days_completed"] = int(shadow_ledger.get("shadow_days_completed", 0) or 0)
+    ndx_model["shadow_required_complete_days"] = int(
+        shadow_ledger.get("required_complete_days", ndx_shadow_run.REQUIRED_COMPLETE_DAYS)
+        or ndx_shadow_run.REQUIRED_COMPLETE_DAYS
+    )
+    if activation_gate["allow_formal_decision"]:
+        data_quality_gate["asset_level_status"]["us_equity"] = {
+            "data_quality_status": "PASS" if ndx_model.get("data_status") == "PASS" else "WARNING",
+            "execution_status": "ELIGIBLE" if ndx_model.get("data_status") == "PASS" else "BLOCKED",
+            "blocking_issues": [] if ndx_model.get("data_status") == "PASS" else ["NDX_PRICE_TEMPERATURE_DATA_NOT_PASS"],
+            "warning_issues": [],
+            "reason": "NDX V1已完成Shadow验证、人工激活及首次决策确认；按当前数据质量门参与正式决策。",
+        }
+    else:
+        activation_blocker = activation_gate["blocking_reason"]
+        data_quality_gate["asset_level_status"]["us_equity"] = {
+            "data_quality_status": "PASS" if ndx_model.get("data_status") == "PASS" else "WARNING",
+            "execution_status": "BLOCKED",
+            "blocking_issues": [
+                "NDX_PRICE_TEMPERATURE_UNDER_VALIDATION",
+                "NDX_OFFLINE_GATE_NOT_PASSED" if not ndx_model.get("offline_pass") else activation_blocker,
+            ],
+            "warning_issues": [],
+            "reason": "NDX价格温度离线验证链未完成，或首次正式决策尚未人工确认；当前不产生正式释放。",
+        }
+    complete = activation_gate["allow_formal_decision"]
     pool_control = model_risk.apply_pool_status(
         data_quality_gate["asset_level_status"],
         {asset: max(0, gaps[asset]) for asset in scores},
@@ -3580,17 +3671,23 @@ def generate_copilot_snapshot(conn, config, market_temperature,
         qdii_carrier_integration,
     )
 
-    # Layer 3: Formal Decision (current: FREEZE blocks all execution)
-    formal_executable_amount = 0.0
-    formal_release_amount = 0.0
-    retained_due_to_decision_freeze = carrier_matching["carrier_coverable_amount"]
+    # Layer 3: Formal Decision. ACTIVE only makes the candidate eligible for
+    # the normal confirmation flow; it does not write execution events here.
+    if pool_control["allow_auto_execution"]:
+        formal_executable_amount = carrier_matching["carrier_coverable_amount"]
+        formal_release_amount = carrier_matching["carrier_coverable_amount"]
+        retained_due_to_decision_freeze = 0.0
+    else:
+        formal_executable_amount = 0.0
+        formal_release_amount = 0.0
+        retained_due_to_decision_freeze = carrier_matching["carrier_coverable_amount"]
 
     formal_decision = {
         "formal_executable_amount": round(formal_executable_amount, 2),
         "formal_release_amount": round(formal_release_amount, 2),
         "retained_due_to_decision_freeze": round(retained_due_to_decision_freeze, 2),
-        "decision_status": "FREEZE",
-        "dynamic_cash_pool_status": "FREEZE",
+        "decision_status": data_quality_gate["decision_status"],
+        "dynamic_cash_pool_status": pool_control["dynamic_cash_pool_status"],
     }
 
     # Build canonical three-layer chain
@@ -3700,19 +3797,6 @@ def generate_copilot_snapshot(conn, config, market_temperature,
         "Fed Funds": fed_funds,
     }
     missing = [name for name, value in required.items() if value is None]
-    shadow_ledger_path = output_paths.REPORTS_ROOT / "shadow" / "ndx-v1" / "shadow-ledger.json"
-    shadow_ledger = {
-        "status": "DAY1_PENDING", "shadow_days_completed": 0,
-        "required_complete_days": ndx_shadow_run.REQUIRED_COMPLETE_DAYS, "activation_status": "NOT_ACTIVE",
-    }
-    if shadow_ledger_path.is_file():
-        try:
-            shadow_ledger = ndx_shadow_run.load_ledger(shadow_ledger_path)
-        except (OSError, ValueError, ndx_shadow_run.ShadowRunError):
-            shadow_ledger = {
-                "status": "SHADOW_FAILED", "shadow_days_completed": 0,
-                "required_complete_days": ndx_shadow_run.REQUIRED_COMPLETE_DAYS, "activation_status": "NOT_ACTIVE",
-            }
     snapshot = {
         "version": "V7",
         "month": month,
@@ -3781,7 +3865,7 @@ def generate_copilot_snapshot(conn, config, market_temperature,
         "data_quality_gate": data_quality_gate,
         "model_status": data_quality_gate["model_status"],
         "validation_stage": ndx_model.get("validation_stage", "OFFLINE_VALIDATION"),
-        "activation_status": "NOT_ACTIVE",
+        "activation_status": activation_status,
         "dynamic_cash_pool_status": pool_control["dynamic_cash_pool_status"],
         "pool_status_reason": pool_control["pool_status_reason"],
         "allow_execution": pool_control["allow_auto_execution"],
@@ -3812,12 +3896,12 @@ def generate_copilot_snapshot(conn, config, market_temperature,
                 "strategic_targets": dict(settings["strategic_allocation"]),
                 "effective_targets": dict(targets),
             },
-            "dynamic_cash_pool_status": "FREEZE",
+            "dynamic_cash_pool_status": pool_control["dynamic_cash_pool_status"],
             "dynamic_cash_pool": round(pool, 2),
             "formula_version": ndx_price_temperature.FORMULA_VERSION,
         },
         "legacy_us_equity_score_status": "RETIRED",
-        "ndx_asset_model_status": "UNDER_VALIDATION",
+        "ndx_asset_model_status": ndx_model["model_status"],
         "ndx_price_temperature": ndx_model,
         "ndx_amount_chain": ndx_amount_chain,
         "v7_decision_chain": v7_decision_chain,
@@ -3825,6 +3909,12 @@ def generate_copilot_snapshot(conn, config, market_temperature,
         "shadow_status": shadow_ledger.get("status", "DAY1_PENDING"),
         "shadow_days_completed": int(shadow_ledger.get("shadow_days_completed", 0)),
         "shadow_required_complete_days": int(shadow_ledger.get("required_complete_days", ndx_shadow_run.REQUIRED_COMPLETE_DAYS)),
+        "ready_for_manual_activation": bool(ndx_model.get("ready_for_manual_activation")),
+        "first_activation_guard": bool(shadow_ledger.get("first_activation_guard")),
+        "first_activation_guard_status": shadow_ledger.get("first_activation_guard_status"),
+        "first_activation_confirmation_required": activation_gate["first_activation_confirmation_required"],
+        "activation_gate_blocking_reason": activation_gate["blocking_reason"],
+        "activation_approved_at": shadow_ledger.get("activation_approved_at"),
         "single_real_yield_factor": {
             "status": "UNDER_VALIDATION",
             "series": "DFII10",
@@ -4130,13 +4220,32 @@ def validate_fund_executions(
 
 
 def apply_copilot_decision(conn, config, decision, fund_executions=None):
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    conn.execute("SAVEPOINT copilot_execution")
+    config_before = json.loads(json.dumps(config))
+    try:
+        result = _apply_copilot_decision(
+            conn, config, decision, fund_executions,
+        )
+    except Exception:
+        conn.execute("ROLLBACK TO copilot_execution")
+        conn.execute("RELEASE copilot_execution")
+        config.clear()
+        config.update(config_before)
+        raise
+    conn.execute("RELEASE copilot_execution")
+    return result
+
+
+def _apply_copilot_decision(conn, config, decision, fund_executions=None):
     if decision != "execute":
         raise ValueError("V7 decision gate only accepts EXECUTE; otherwise the system remains FREEZE")
     ensure_monthly_contribution(conn, config)
     market_temperature = generate_market_temperature(conn, config)
     snapshot = generate_copilot_snapshot(conn, config, market_temperature)
-    if snapshot.get("user_decision"):
-        raise ValueError("本月方案已经处理")
+    if snapshot.get("user_decision") or allocation_event(conn, snapshot["month"]):
+        raise ValueError("ALREADY_EXECUTED: 本月方案已经处理")
     if decision == "execute" and not snapshot.get("allow_execution", False):
         issues = snapshot.get("data_quality_gate", {}).get("blocking_issues", [])
         raise ValueError(
@@ -4170,6 +4279,8 @@ def apply_copilot_decision(conn, config, decision, fund_executions=None):
             sum(row["actual_executed_amount"] for row in executions),
             2,
         )
+        if actual_total <= 0:
+            raise ValueError("实际执行金额合计必须大于0")
         actual_allocations = {
             asset: round(
                 sum(
@@ -4179,14 +4290,6 @@ def apply_copilot_decision(conn, config, decision, fund_executions=None):
                 ),
                 2,
             )
-            for asset in ("a_share", "us_equity", "gold")
-        }
-        selected_plan_allocations = {
-            asset: round(sum(
-                float(row.get("planned_amount", 0) or 0)
-                for row in selected_plan
-                if row.get("asset_class") == asset
-            ), 2)
             for asset in ("a_share", "us_equity", "gold")
         }
         pool = max(
@@ -4245,10 +4348,9 @@ def apply_copilot_decision(conn, config, decision, fund_executions=None):
                 ensure_ascii=False,
             ),
             now,
-            selected_max if is_execution else snapshot["plan_amount"],
+            snapshot["plan_amount"],
             json.dumps(
-                selected_plan_allocations if is_execution
-                else snapshot["allocation_plan"],
+                snapshot["allocation_plan"],
                 ensure_ascii=False,
             ),
             now if is_execution else None,
@@ -5273,7 +5375,7 @@ def render_daily_automation_html(copilot):
         <article class="panel das-hero das-border-{run_state['color']}">
           <span class="eyebrow">每日自动化 · 执行总览</span>
           <h2>今日结论：{html.escape(run_state['label'])}</h2>
-          <p class="das-freshness">数据截止 {generated} · 本页为服务端快照、<strong>非实时</strong>；在每日 09:10 与影子运行成功后自动刷新，查看最新请重载浏览器。</p>
+          <p class="das-freshness">数据截止 {generated} · 本页为服务端快照、<strong>非实时</strong>；在每日数据刷新及正式决策生成后自动更新，查看最新请重载浏览器。</p>
           <div class="das-summary">
             <div class="das-cell"><span class="das-k">生成时间</span><span class="das-v">{generated}</span></div>
             <div class="das-cell"><span class="das-k">目标交易日</span><span class="das-v">{target_txt}</span></div>
@@ -5812,6 +5914,39 @@ def write_copilot_dashboard(
             f"<li><span>{html.escape(flow_title)}</span><strong>0 元</strong></li>"
         )
 
+    release_direction_rows = []
+    for asset in ("a_share", "us_equity", "gold"):
+        routing = routing_assets.get(asset, {})
+        amount = float(display_allocations.get(asset, 0) or 0)
+        release_factor = float(routing.get("release_factor", 1) or 0)
+        if execution_disabled:
+            direction = "资金池冻结"
+        elif amount <= 0:
+            direction = "当前无正向执行金额"
+        else:
+            direction = (
+                f"配置缺口 {float(routing.get('positive_gap', 0) or 0):,.0f} 元"
+                f" · 有效释放系数 {release_factor * 100:.1f}%"
+            )
+        release_direction_rows.append(
+            "<tr><td>%s</td><td>%.2f 元</td><td>%s</td></tr>" % (
+                html.escape(asset_label(asset)), amount, html.escape(direction),
+            )
+        )
+    release_direction_html = f"""
+        <section class="panel" style="margin-bottom:14px;">
+          <span class="eyebrow">Release Allocation Flow</span>
+          <h2>本月动态资金释放方向</h2>
+          <p class="muted">本月资产层计划 {display_amount:,.2f} 元 · {'等待执行确认' if status == 'pending' and not execution_disabled else '当前不产生执行方案' if execution_disabled else '本月方案已处理'}</p>
+          <table>
+            <thead><tr><th>资产方向</th><th>本月计划</th><th>计算依据</th></tr></thead>
+            <tbody>{''.join(release_direction_rows)}</tbody>
+          </table>
+          <p class="muted" style="margin-top:10px;">NDX 独立候选承接上限在「配置与资金流」中单列展示；它不等同于本月资产层计划，也不代表已执行金额。</p>
+          <a class="ac-detail-link" data-nav-to="allocation-flow">查看基金载体计划与金额链 →</a>
+        </section>
+    """
+
     carrier_plan = copilot.get("fund_carrier_plan", [])
     fund_executions = copilot.get("fund_executions", [])
     if status == "executed":
@@ -5870,6 +6005,9 @@ def write_copilot_dashboard(
         """
         for row in carrier_plan
     )
+    executable_fund_plan_amount = round(sum(
+        float(row.get("planned_amount", 0) or 0) for row in carrier_plan
+    ), 2)
 
     disabled = execution_disabled or status != "pending" or plan_amount <= 0
     pool_note_html = (
@@ -6177,10 +6315,7 @@ def write_copilot_dashboard(
           <td>{html.escape(row['fund_name'])}<small>{html.escape(row['fund_code'])}</small></td>
           <td>{html.escape(row.get('asset_name', asset_label(row['asset_class'])))}</td>
           <td>{float(row['planned_amount']):,.0f}</td>
-          <td><input class="fund-actual" type="number" min="0"
-            max="{float(row['planned_amount']):.2f}" step="0.01"
-            data-fund-code="{html.escape(row['fund_code'])}"
-            value="{float(row['planned_amount']):.2f}"></td>
+          <td>在确认弹窗填写</td>
         </tr>
         """
 
@@ -6253,12 +6388,17 @@ def write_copilot_dashboard(
             <tbody>{fund_carrier_rows_for_tab3}</tbody>
           </table>
           <p class="muted" style="color:#bac5d6;margin-top:10px;">
-            未执行余额：{unexecuted_amount:,.0f} 元 &nbsp;|&nbsp; 剩余资金池：{remaining_pool:,.0f} 元
+            资产层建议：{plan_amount:,.0f} 元 &nbsp;|&nbsp;
+            当前基金计划可承接：{executable_fund_plan_amount:,.0f} 元 &nbsp;|&nbsp;
+            容量未覆盖：{max(0, plan_amount - executable_fund_plan_amount):,.0f} 元（保留在资金池）
+          </p>
+          <p class="muted" style="color:#bac5d6;margin-top:6px;">
+            本月已实际执行：0.00 元 &nbsp;|&nbsp;
+            当前 Dynamic Cash Pool：{remaining_pool:,.2f} 元（扣除已实际执行金额后的余额）
           </p>
           <ul class="rule">{reasons_html}</ul>
           <div class="button-row">
             <button class="primary" data-decision="execute">执行本月方案</button>
-            <button class="secondary" data-decision="ignore">忽略本月方案</button>
           </div>
           <div id="message"></div>
         </article>
@@ -6377,6 +6517,7 @@ def write_copilot_dashboard(
     carrier_selection_status = str(qdii_overview.get("carrier_selection_status") or "BLOCKED")
     carrier_title = (
         "载体可用" if carrier_snapshot_valid and carrier_selection_status == "AVAILABLE"
+        else "部分容量可用" if carrier_snapshot_valid and carrier_selection_status == "PARTIAL_CAPACITY"
         else "快照过期" if carrier_data_status == "STALE"
         else "载体不可用"
     )
@@ -6390,13 +6531,24 @@ def write_copilot_dashboard(
     pct = lambda value: "-" if value is None else "%.1f%%" % (float(value) * 100)
     raw_pct = lambda value: "-" if value is None else "%.1f%%" % float(value)
     ndx_score_val = float(ndx_shadow.get('temperature_score') or 0)
+    ndx_model_active = (
+        copilot.get("ndx_asset_model_status") == "ACTIVE"
+        and copilot.get("activation_status") == "ACTIVE"
+    )
+    ndx_card_status = (
+        "ACTIVE · 已进入正式决策" if ndx_model_active and not execution_disabled
+        else "ACTIVE · 决策门当前冻结" if ndx_model_active
+        else "Validation · 待影子运行"
+    )
+    ndx_card_status_class = "eligible" if ndx_model_active and not execution_disabled else "validation"
+    ndx_asset_plan = float(copilot.get("allocation_plan", {}).get("us_equity", 0) or 0)
     ndx_card = f"""
       <article class="asset-card summary">
         <div class="ac-head"><span class="ac-name">NDX价格温度</span><span class="ac-tier hot">{html.escape(ndx_level)}</span></div>
         <div class="ac-score-row"><strong class="ac-score">{ndx_score_val:.1f}</strong><em class="ac-score-unit">/100</em></div>
         <div class="ac-bar-wrap"><div class="ac-bar" style="width:{max(0, min(100, ndx_score_val)):.1f}%;background:#e07830"></div></div>
-        <div class="ac-status validation">Validation · 待影子运行</div>
-        <div class="ac-keyline"><span class="k">候选释放</span><span class="v">{pct(ndx_shadow.get('candidate_effective_release_factor'))} · 冻结保留</span></div>
+        <div class="ac-status {ndx_card_status_class}">{html.escape(ndx_card_status)}</div>
+        <div class="ac-keyline"><span class="k">本月资产层方向</span><span class="v">{ndx_asset_plan:,.0f} 元</span></div>
         <a class="ac-detail-link" data-nav-to="allocation-flow">QDII执行载体 →</a>
       </article>"""
     global_card = f"""
@@ -6416,7 +6568,7 @@ def write_copilot_dashboard(
         <h2>Shadow Day {shadow_days_completed} / {shadow_required_days}</h2>
         <div class="ac-detail-row"><span>当前状态</span><strong>{html.escape(shadow_status)}</strong></div>
         <div class="ac-detail-row"><span>下一个可累计日</span><strong>仅限下一个完整NASDAQ交易日收盘后</strong></div>
-        <div class="ac-detail-row"><span>Dynamic Cash Pool</span><strong>FREEZE</strong></div>
+        <div class="ac-detail-row"><span>Dynamic Cash Pool</span><strong>{html.escape(pool_model_status)}</strong></div>
         <p class="muted">Day 0不计数；周末、休市、盘中、重复日期和失败日均不得累计。</p>
       </article>
     """
@@ -6451,13 +6603,13 @@ def write_copilot_dashboard(
         <tr><td>上一有效/最近观察容量</td><td>{float(v7_cm.get('last_known_approved_carrier_capacity', ndx_chain.get('last_known_approved_carrier_capacity', 0)) or 0):,.2f} 元</td></tr>
         <tr><td>当前有效载体容量</td><td>{float(v7_cm.get('current_effective_carrier_capacity', ndx_chain.get('current_effective_carrier_capacity', 0)) or 0):,.2f} 元</td></tr>
         <tr><td>载体快照有效</td><td>{'是' if (v7_cm.get('carrier_snapshot_valid') or ndx_chain.get('carrier_snapshot_valid')) else '否'}</td></tr>
-        <tr><th colspan="2" style="background:#f0f4f8;font-size:12px;padding:6px 8px;">Layer 3 — 正式决策层 (FREEZE blocks all formal execution)</th></tr>
-        <tr><td>正式可执行金额</td><td>{float(v7_fd.get('formal_executable_amount', amount_chain.get('formal_executable_amount', 0)) or 0):,.2f} 元</td></tr>
-        <tr><td>正式释放金额</td><td>{float(v7_fd.get('formal_release_amount', amount_chain.get('formal_release_amount', 0)) or 0):,.2f} 元</td></tr>
+        <tr><th colspan="2" style="background:#f0f4f8;font-size:12px;padding:6px 8px;">Layer 3 — NDX 独立候选承接结果</th></tr>
+        <tr><td>候选可承接上限</td><td>{float(v7_fd.get('formal_executable_amount', amount_chain.get('formal_executable_amount', 0)) or 0):,.2f} 元</td></tr>
+        <tr><td>候选承接金额</td><td>{float(v7_fd.get('formal_release_amount', amount_chain.get('formal_release_amount', 0)) or 0):,.2f} 元</td></tr>
         <tr><td>决策冻结保留金额</td><td>{float(v7_fd.get('retained_due_to_decision_freeze', amount_chain.get('retained_due_to_decision_freeze', 0)) or 0):,.2f} 元</td></tr>
         {identity_html}
       </tbody></table>
-      <p class="muted">上述金额为离线验证候选值，不构成正式执行信号。Dynamic Cash Pool保持FREEZE。</p>
+      <p class="muted">上述为NDX独立候选承接上限，不等同于本月资产层计划或实际执行金额。本月方向与基金计划以「资产层建议」为准。</p>
     </article>
     """
     # Keep the protected A-share and gold cards intact while inserting the two
@@ -6549,15 +6701,22 @@ def write_copilot_dashboard(
     ndx_level = ndx_level_labels.get(ndx_shadow.get("temperature_level"), "不可用")
     pct = lambda value: "-" if value is None else "%.1f%%" % (float(value) * 100)
     raw_pct = lambda value: "-" if value is None else "%.1f%%" % float(value)
+    ndx_model_status_text = str(copilot.get("ndx_asset_model_status") or ndx_shadow.get("model_status") or "UNDER_VALIDATION")
+    activation_status_text = str(copilot.get("activation_status") or ndx_shadow.get("activation_status") or "NOT_ACTIVE")
+    ndx_status_pair = "%s / %s" % (
+        ndx_model_status_text,
+        html.escape(str(ndx_shadow.get("validation_stage") or copilot.get("validation_stage") or "OFFLINE_VALIDATION")),
+    )
+    formal_release_display = float(v7_fd.get('formal_release_amount', amount_chain.get('formal_release_amount', 0)) or 0)
     qdii_panel_html = f"""
         <article class="panel section-spacer">
           <span class="eyebrow">NDX资产机会</span>
-          <h2>温度分 {float(ndx_shadow.get('temperature_score') or 0):.1f} / 100 · {html.escape(ndx_level)}<small style="font-size:11px;color:var(--muted);"> UNDER_VALIDATION / {html.escape(str(ndx_shadow.get('validation_stage') or 'OFFLINE_VALIDATION'))}</small></h2>
+          <h2>温度分 {float(ndx_shadow.get('temperature_score') or 0):.1f} / 100 · {html.escape(ndx_level)}<small style="font-size:11px;color:var(--muted);"> {html.escape(ndx_status_pair)} · {html.escape(activation_status_text)}</small></h2>
           <div class="overview-grid" style="margin:12px 0;">
             <div><span>价格基础释放</span><strong>{pct(ndx_shadow.get('base_release_factor'))}</strong></div>
             <div><span>实际利率调整后</span><strong>{pct(ndx_shadow.get('rate_adjusted_release_factor'))}</strong></div>
             <div><span>波动率上限</span><strong>{pct(ndx_shadow.get('volatility_cap'))}</strong></div>
-            <div><span>最终候选释放</span><strong>{pct(ndx_shadow.get('candidate_effective_release_factor'))}</strong><small>正式释放 0 元</small></div>
+            <div><span>最终候选释放</span><strong>{pct(ndx_shadow.get('candidate_effective_release_factor'))}</strong><small>独立候选承接上限 {formal_release_display:,.0f} 元</small></div>
           </div>
           <table><tbody>
             <tr><td>距离MA500</td><td>{pct(ndx_shadow.get('distance_to_ma500'))}</td></tr>
@@ -6574,12 +6733,12 @@ def write_copilot_dashboard(
             <tr><td>上一有效/最近观察容量</td><td>{float(v7_cm.get('last_known_approved_carrier_capacity', ndx_chain.get('last_known_approved_carrier_capacity', 0)) or 0):,.2f} 元</td></tr>
             <tr><td>当前有效容量</td><td>{float(v7_cm.get('current_effective_carrier_capacity', ndx_chain.get('current_effective_carrier_capacity', 0)) or 0):,.2f} 元</td></tr>
             <tr><td>载体状态</td><td>{html.escape('可用' if (v7_cm.get('carrier_snapshot_valid') or carrier_snapshot_valid) else '快照过期，当前不可执行' if carrier_data_status == 'STALE' else '载体不可用，当前不可执行')}</td></tr>
-            <tr><th colspan="2" style="background:#f0f4f8;font-size:11px;padding:4px 6px;">V7 Layer 3 — 正式决策</th></tr>
-            <tr><td>正式可执行金额</td><td>{float(v7_fd.get('formal_executable_amount', amount_chain.get('formal_executable_amount', 0)) or 0):,.2f} 元</td></tr>
-            <tr><td>正式释放金额</td><td>{float(v7_fd.get('formal_release_amount', amount_chain.get('formal_release_amount', 0)) or 0):,.2f} 元</td></tr>
+            <tr><th colspan="2" style="background:#f0f4f8;font-size:11px;padding:4px 6px;">V7 Layer 3 — NDX 独立候选承接结果</th></tr>
+            <tr><td>候选可承接上限</td><td>{float(v7_fd.get('formal_executable_amount', amount_chain.get('formal_executable_amount', 0)) or 0):,.2f} 元</td></tr>
+            <tr><td>候选承接金额</td><td>{float(v7_fd.get('formal_release_amount', amount_chain.get('formal_release_amount', 0)) or 0):,.2f} 元</td></tr>
             <tr><td>决策冻结保留金额</td><td>{float(v7_fd.get('retained_due_to_decision_freeze', amount_chain.get('retained_due_to_decision_freeze', 0)) or 0):,.2f} 元</td></tr>
           </tbody></table>
-          <p class="muted">离线候选结果，不构成正式执行信号。0分=极热，100分=极冷。价格决定机会，DFII10与60日波动率只调节释放节奏；价格越冷不代表市场已经见底，也不保证未来上涨。PE不参与正式计算。</p>
+          <p class="muted">NDX V1价格温度用于释放节奏；0分=极热，100分=极冷。ACTIVE 只表示模型可进入正式决策门，实际执行仍需数据、载体、资金池与人工确认全部通过。PE不参与正式计算。</p>
         </article>
         <article class="panel section-spacer">
           <span class="eyebrow">QDII执行载体</span>
@@ -6604,7 +6763,7 @@ def write_copilot_dashboard(
             <span id="qdii-complexity-warning"></span>
           </div>
           <p class="muted">同一指数正常建议：1只主载体 + 1至2只备用载体。万家019441额度近期在50元与10000元之间反复切换，执行前请再次确认渠道实际限额。</p>
-          <button id="qdii-execute-button" class="primary" type="button" disabled aria-disabled="true">当前FREEZE，执行确认不可用</button>
+          <p class="muted"><strong>此区域仅用于载体能力预览，不执行、不入账。</strong>正式确认请使用下方“执行本月方案”。I类基金仅在显式批准后进入自动承接，未覆盖金额保留在 Dynamic Cash Pool。</p>
         </article>
         <article class="panel section-spacer">
           <span class="eyebrow">Global Active Equity Pool</span>
@@ -6665,7 +6824,7 @@ def write_copilot_dashboard(
         <thead><tr><th>基金</th><th>资产</th><th>计划金额</th><th>实际金额</th></tr></thead>
         <tbody>{modal_rows}</tbody>
       </table>
-      <div class="modal-total">当前可执行合计 <strong id="execution-total">{plan_amount:,.2f}</strong> 元</div>
+      <div class="modal-total">当前可执行合计 <strong id="execution-total">{executable_fund_plan_amount:,.2f}</strong> 元</div>
       <div class="button-row">
         <button type="button" class="primary" id="execution-confirm">确认执行并入账</button>
         <button type="button" class="secondary" id="execution-cancel-bottom">取消</button>
@@ -6753,12 +6912,24 @@ def write_copilot_dashboard(
     # 全部由既有快照字段组合而成，不引入任何新指标或新计算。
     shadow_done = int(copilot.get("shadow_days_completed", 0) or 0)
     shadow_need = int(copilot.get("shadow_required_complete_days", ndx_shadow_run.REQUIRED_COMPLETE_DAYS) or ndx_shadow_run.REQUIRED_COMPLETE_DAYS)
+    ndx_model_active = copilot.get("ndx_asset_model_status") == "ACTIVE" and copilot.get("activation_status") == "ACTIVE"
 
     if execution_disabled:
-        hero_oneline = (
-            f"纳指 NDX 新模型仍在影子验证（Shadow Day {shadow_done} / {shadow_need}），"
-            "完成前禁止任何自动释放；A股、黄金、QDII 载体数据均已通过，PE 仅供展示、不构成阻断。"
-        )
+        if ndx_model_active:
+            hero_oneline = (
+                "NDX V1 已完成 Shadow 验证并激活；当前动态资金池仍由数据质量、载体、"
+                "本月触发规则或人工确认门决定是否执行。"
+            )
+        elif shadow_done >= shadow_need:
+            hero_oneline = (
+                f"纳指 NDX 新模型已完成 Shadow Day {shadow_done} / {shadow_need}，"
+                "等待人工激活前仍不会释放任何资金。"
+            )
+        else:
+            hero_oneline = (
+                f"纳指 NDX 新模型仍在影子验证（Shadow Day {shadow_done} / {shadow_need}），"
+                "完成前禁止任何自动释放；A股、黄金、QDII 载体数据均已通过，PE 仅供展示、不构成阻断。"
+            )
     else:
         hero_oneline = html.escape(
             copilot.get("pool_status_reason") or "全部核心数据通过，动态资金池释放通道就绪。"
@@ -6771,10 +6942,14 @@ def write_copilot_dashboard(
     )
     focus_items = []
     if execution_disabled:
+        freeze_focus = (
+            f"<strong>动态资金池保持冻结。</strong>NDX V1 已激活，但当前正式决策门未允许执行。"
+            if ndx_model_active
+            else f"<strong>动态资金池保持冻结。</strong>纳指 NDX 新模型处于影子验证 Day {shadow_done} / {shadow_need}，未激活前不会自动释放任何资金。"
+        )
         focus_items.append((
             "risk",
-            f"<strong>动态资金池保持冻结。</strong>纳指 NDX 新模型处于影子验证 "
-            f"Day {shadow_done} / {shadow_need}，未完成前不会自动释放任何资金。",
+            freeze_focus,
         ))
     else:
         focus_items.append((
@@ -6825,19 +7000,20 @@ def write_copilot_dashboard(
     # 四个治理状态域（模型行情 / NDX模型 / QDII载体 / 执行）从 Hero 迁到 Alert
     # Summary 底部，保持「状态域分离」治理不变量可见，同时让 Hero 保持精简。
     carrier_chip_class = "ok" if carrier_snapshot_valid else "warn"
+    ndx_chip_class = "ok" if ndx_model_active else "warn"
     governance_status_row = (
         '<div class="dh-status-bar" style="margin-top:12px;">'
         '<span class="dh-status-chip ok">模型行情数据：PASS</span>'
-        '<span class="dh-status-chip warn">NDX模型状态：UNDER_VALIDATION</span>'
+        f'<span class="dh-status-chip {ndx_chip_class}">NDX模型状态：{html.escape(ndx_model_status_text)}</span>'
         f'<span class="dh-status-chip {carrier_chip_class}">QDII载体数据：{html.escape(carrier_data_status)}</span>'
         f'<span class="dh-status-chip {"warn" if execution_disabled else "ok"}">执行状态：{html.escape(disabled_status_text)}</span>'
         f'<span style="margin-left:auto;">Last Full Audit: {html.escape(model_risk.LAST_AUDIT_DATE)}</span>'
         f'<span>Last Data Refresh: {html.escape(generated_at[:16])}</span>'
         '</div>'
     )
-    alert_items = [
-        "NDX价格温度 — 模型方法论验证中（UNDER_VALIDATION）",
-        "单一实际利率因子 — 模型方法论验证中",
+    alert_items = [] if ndx_model_active else [
+        "NDX价格温度 — 等待人工激活" if shadow_done >= shadow_need else "NDX价格温度 — 模型方法论验证中（UNDER_VALIDATION）",
+        "单一实际利率因子 — 等待人工激活" if shadow_done >= shadow_need else "单一实际利率因子 — 模型方法论验证中",
     ] if execution_disabled else []
     if alert_items:
         alert_rows = "".join(
@@ -6988,7 +7164,8 @@ def write_copilot_dashboard(
       var toastEl = document.getElementById('pm-toast');
       var current = null;
       var LIVE = ['hero','today-focus','asset-cards','alert-summary','allocation-table',
-                  'overseas-split','triggers','flow-audit','decision-status','portfolio-table'];
+                  'overseas-split','execution-control','triggers','flow-audit',
+                  'decision-status','portfolio-table'];
 
       function openModal(btn) {
         current = { type: btn.getAttribute('data-pm-type'), code: btn.getAttribute('data-pm-code') || '',
@@ -7488,6 +7665,8 @@ def write_copilot_dashboard(
           <a class="dh-cta" data-nav-to="data-audit">查看决策与验证详情 →</a>
         </article>
 
+        {release_direction_html}
+
         {todays_focus_html}
 
         <section class="asset-cards" data-live="asset-cards">
@@ -7544,6 +7723,10 @@ def write_copilot_dashboard(
 
         {qdii_panel_html}
 
+        <div class="section-spacer" data-live="execution-control">
+          {execution_tab_content}
+        </div>
+
         <article class="panel section-spacer">
           <span class="eyebrow">Historical Execution</span>
           <h2>Historical Executed Amount: {executed_amount:,.0f} 元</h2>
@@ -7598,8 +7781,8 @@ def write_copilot_dashboard(
             <tbody>
               <tr><td style="color:var(--green);font-weight:650;">模型行情数据阻断</td><td>NONE</td><td>模型行情数据新鲜度：PASS</td></tr>
               <tr><td style="color:{'var(--green)' if carrier_snapshot_valid else 'var(--amber)'};font-weight:650;">QDII载体数据状态</td><td>{html.escape(carrier_data_status)}</td><td>QDII载体选择状态：{html.escape(carrier_selection_status)} · 快照有效性：{'有效' if carrier_snapshot_valid else '无效'}</td></tr>
-              <tr><td style="color:var(--amber);font-weight:650;">Model Activation Blockers</td><td>UNDER_VALIDATION</td><td>NDX_PRICE_TEMPERATURE_V1 与 SINGLE_REAL_YIELD_FACTOR 仍在方法论验证中</td></tr>
-              <tr><td style="color:var(--red);font-weight:650;">Execution Blockers</td><td>FREEZE</td><td>DYNAMIC_CASH_POOL 因模型未完成验证保持冻结；固定定投不受影响</td></tr>
+              <tr><td style="color:{'var(--green)' if ndx_model_active else 'var(--amber)'};font-weight:650;">Model Activation Blockers</td><td>{html.escape(ndx_model_status_text)}</td><td>{'NDX_PRICE_TEMPERATURE_V1 已完成 Shadow 验证并激活' if ndx_model_active else 'NDX_PRICE_TEMPERATURE_V1 与 SINGLE_REAL_YIELD_FACTOR 尚未激活'}</td></tr>
+              <tr><td style="color:{'var(--red)' if execution_disabled else 'var(--green)'};font-weight:650;">Execution Blockers</td><td>{html.escape(disabled_status_text)}</td><td>{html.escape(copilot.get('pool_status_reason', 'DYNAMIC_CASH_POOL 当前不可执行') if execution_disabled else '正式决策门已通过；仍需用户确认执行并入账。')}固定定投不受影响</td></tr>
             </tbody>
           </table>
           <p class="muted" style="margin-top:8px;">固定定投不受影响。</p>
@@ -7631,7 +7814,7 @@ def write_copilot_dashboard(
             <tr><td>sp500_pe.used_in_score</td><td>false</td></tr>
             <tr><td>sp500_pe.used_in_release_factor</td><td>false</td></tr>
             <tr><td>sp500_pe.blocking</td><td>false · DISPLAY_ONLY</td></tr>
-            <tr><td>NDX_PRICE_TEMPERATURE_V1</td><td>UNDER_VALIDATION</td></tr>
+            <tr><td>NDX_PRICE_TEMPERATURE_V1</td><td>{html.escape(ndx_model_status_text)}</td></tr>
             <tr><td>formula_version</td><td>{html.escape(str(ndx_shadow.get('formula_version') or ndx_price_temperature.FORMULA_VERSION))}</td></tr>
             <tr><td>price_source</td><td>{html.escape(str(ndx_shadow.get('source_name') or '-'))}</td></tr>
             <tr><td>price_proxy_status</td><td>{html.escape(str(ndx_shadow.get('proxy_status') or '-'))}</td></tr>
@@ -7854,21 +8037,11 @@ def write_copilot_dashboard(
         var previewStatus;
         if (assetAmount <= tolerance && assigned <= tolerance) {{ previewStatus = 'EMPTY'; }}
         else if (assetAmount > tolerance && exactMatch && !overLimit && !unselectedNonzero
-          && snapshotValid && carrierSelectionStatus === 'AVAILABLE') {{ previewStatus = 'VALID'; }}
+          && snapshotValid && ['AVAILABLE', 'PARTIAL_CAPACITY'].includes(carrierSelectionStatus)) {{ previewStatus = 'VALID'; }}
         else {{ previewStatus = 'INVALID'; }}
         if (previewStatusEl) {{
           previewStatusEl.textContent = previewStatus;
           previewStatusEl.style.color = previewStatus === 'VALID' ? 'var(--green)' : (previewStatus === 'EMPTY' ? 'var(--muted)' : 'var(--red)');
-        }}
-        var executeBtn = document.getElementById('qdii-execute-button');
-        var cashPoolStatus = mainEl ? mainEl.dataset.cashPoolStatus : 'FREEZE';
-        var dynamicCashPoolIsFrozen = cashPoolStatus !== 'ACTIVE';
-        if (executeBtn) {{
-          executeBtn.disabled = dynamicCashPoolIsFrozen || previewStatus !== 'VALID';
-          executeBtn.setAttribute('aria-disabled', String(executeBtn.disabled));
-          executeBtn.textContent = dynamicCashPoolIsFrozen
-            ? 'Execution disabled because Dynamic Cash Pool is Frozen'
-            : (previewStatus === 'VALID' ? '确认执行' : '分配金额必须精确匹配后方可执行');
         }}
         document.getElementById('qdii-selected-capacity').textContent = capacity.toFixed(2) + ' 元';
         document.getElementById('qdii-assigned').textContent = assigned.toFixed(2) + ' 元';

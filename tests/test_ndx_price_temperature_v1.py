@@ -1,5 +1,6 @@
 import datetime as dt
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import cn_equity_temperature
@@ -101,13 +102,15 @@ class NdxPriceTemperatureV1Tests(unittest.TestCase):
         result = qdii_carrier.calculate_multi_select({"021000": 1000, "539001": 1}, 1000, carriers(), selected_codes={"021000"})
         self.assertEqual(result["preview_status"], "INVALID")
 
-    def test_26_freeze_valid_button_disabled(self):
+    def test_26_qdii_preview_is_not_an_execution_entry(self):
         text = Path("fund_tracker.py").read_text(encoding="utf-8")
-        self.assertIn("dynamicCashPoolIsFrozen || previewStatus !== 'VALID'", text)
+        self.assertNotIn("qdii-execute-button", text)
+        self.assertIn("此区域仅用于载体能力预览，不执行、不入账", text)
 
-    def test_27_active_valid_button_rule(self):
+    def test_27_total_execution_entry_uses_execute_status(self):
         text = Path("fund_tracker.py").read_text(encoding="utf-8")
-        self.assertIn("cashPoolStatus !== 'ACTIVE'", text)
+        self.assertIn("执行本月方案", text)
+        self.assertIn('execution_disabled = not bool(copilot.get("allow_auto_execution", False))', text)
 
     def test_28_capacity_shortfall_retained(self):
         mc = ndx.candidate_amount_chain(1000, 1, 1000)
@@ -156,6 +159,31 @@ class NdxPriceTemperatureV1Tests(unittest.TestCase):
 
     def test_35_fixed_investment_regression(self):
         self.assertIn("固定定投", Path("dist/Asset Allocation Copilot V7.html").read_text(encoding="utf-8"))
+
+    def test_36_pending_first_activation_guard_freezes_generated_snapshot(self):
+        import fund_tracker
+        lifecycle = {
+            "status": "SHADOW_COMPLETE", "shadow_days_completed": 5,
+            "required_complete_days": 5, "activation_status": "ACTIVE",
+            "model_status": "ACTIVE", "validation_stage": "OFFLINE_PASS",
+            "first_activation_guard": True,
+            "first_activation_guard_status": "PENDING_MANUAL_CONFIRMATION",
+            "ready_for_manual_activation_review": True,
+        }
+        config = fund_tracker.load_config()
+        conn = fund_tracker.connect_db()
+        try:
+            temperature = fund_tracker.generate_market_temperature(conn, config)
+            with mock.patch.object(fund_tracker, "load_ndx_shadow_lifecycle", return_value=lifecycle):
+                snapshot = fund_tracker.generate_copilot_snapshot(conn, config, temperature)
+        finally:
+            conn.close()
+        formal = snapshot["v7_decision_chain"]["formal_decision"]
+        self.assertEqual(snapshot["decision_status"], "FREEZE")
+        self.assertFalse(snapshot["allow_execution"])
+        self.assertEqual(snapshot["activation_gate_blocking_reason"], "NDX_FIRST_ACTIVATION_CONFIRMATION_REQUIRED")
+        self.assertEqual(formal["formal_executable_amount"], 0.0)
+        self.assertEqual(formal["formal_release_amount"], 0.0)
 
 
 if __name__ == "__main__":

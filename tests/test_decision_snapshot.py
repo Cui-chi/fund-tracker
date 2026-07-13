@@ -109,3 +109,18 @@ class DecisionSnapshotTests(unittest.TestCase):
             )
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM manual_override_snapshots").fetchone()[0], 0)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM allocation_events").fetchone()[0], 0)
+
+    def test_existing_monthly_event_blocks_duplicate_execution(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE allocation_events (id INTEGER PRIMARY KEY, month TEXT, decision TEXT, deploy_amount REAL, allocation_json TEXT, created_at TEXT, plan_amount REAL, plan_allocation_json TEXT, executed_at TEXT, execution_type TEXT)")
+        conn.execute(
+            "INSERT INTO allocation_events VALUES (1, '2026-07', 'execute', 100, '{}', '2026-07-01', 200, '{}', '2026-07-01', 'Model Auto Execution')"
+        )
+        snapshot = {"month": "2026-07", "user_decision": None}
+        with mock.patch.object(fund_tracker, "ensure_monthly_contribution"), \
+             mock.patch.object(fund_tracker, "generate_market_temperature", return_value={}), \
+             mock.patch.object(fund_tracker, "generate_copilot_snapshot", return_value=snapshot):
+            with self.assertRaisesRegex(ValueError, "ALREADY_EXECUTED"):
+                fund_tracker.apply_copilot_decision(conn, {}, "execute", [])
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM allocation_events").fetchone()[0], 1)

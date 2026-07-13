@@ -666,6 +666,116 @@ def initialize_ledger(day0_report_path, ledger_path, generated_at=None):
     return ledger
 
 
+def approve_manual_activation(ledger_path, approved_by="manual", generated_at=None):
+    """Move a completed shadow ledger into ACTIVE after explicit review.
+
+    This does not release cash, alter historical shadow days, or write execution
+    events. It only records that the validation period is complete and the model
+    may be considered by the normal decision gate.
+    """
+    ledger_path = Path(ledger_path)
+    approved_at = (generated_at or dt.datetime.now().astimezone()).isoformat(timespec="seconds")
+    with ledger_lock(ledger_path):
+        ledger = load_ledger(ledger_path)
+        required = int(ledger.get("required_complete_days", REQUIRED_COMPLETE_DAYS) or 0)
+        completed = int(ledger.get("shadow_days_completed", 0) or 0)
+        if ledger.get("status") != "SHADOW_COMPLETE":
+            raise ShadowRunError("shadow ledger is not complete")
+        if completed < required or len(ledger.get("days", [])) < required:
+            raise ShadowRunError("shadow ledger has insufficient successful days")
+        if not ledger.get("ready_for_manual_activation_review"):
+            raise ShadowRunError("shadow ledger is not ready for manual activation review")
+        if ledger.get("activation_status") == "ACTIVE":
+            return ledger
+        previous = {
+            "status": ledger.get("status"),
+            "activation_status": ledger.get("activation_status", "NOT_ACTIVE"),
+            "decision_status": ledger.get("decision_status", "FREEZE"),
+            "dynamic_cash_pool_status": ledger.get("dynamic_cash_pool_status", "FREEZE"),
+        }
+        audit = {
+            "activation_id": "ndx-v1-activation-" + approved_at.replace(":", "").replace("+", "-"),
+            "model_version": MODEL_VERSION,
+            "previous_status": previous,
+            "new_status": {
+                "status": "SHADOW_COMPLETE",
+                "activation_status": "ACTIVE",
+                "model_status": "ACTIVE",
+                "decision_status": "FREEZE",
+                "dynamic_cash_pool_status": "FREEZE",
+                "first_activation_guard": True,
+            },
+            "shadow_days": completed,
+            "approved_time": approved_at,
+            "approved_by": approved_by,
+            "validation_result": "OFFLINE_PASS",
+            "decision_result": "MANUAL_CONFIRMATION_REQUIRED",
+        }
+        ledger.setdefault("activation_audit", []).append(audit)
+        ledger["activation_status"] = "ACTIVE"
+        ledger["model_status"] = "ACTIVE"
+        ledger["validation_stage"] = "OFFLINE_PASS"
+        ledger["activation_approved_at"] = approved_at
+        ledger["activation_approved_by"] = approved_by
+        ledger["first_activation_guard"] = True
+        ledger["first_activation_guard_status"] = "PENDING_MANUAL_CONFIRMATION"
+        ledger["decision_status"] = "FREEZE"
+        ledger["dynamic_cash_pool_status"] = "FREEZE"
+        ledger["updated_at"] = approved_at
+        ledger["ledger_sha256"] = _ledger_hash(ledger)
+        _atomic_write_json(ledger_path, ledger)
+        return ledger
+
+
+def confirm_first_activation_guard(ledger_path, confirmed_by="manual", generated_at=None):
+    """Confirm the first post-shadow decision gate without releasing cash.
+
+    Activation makes the model eligible for the formal decision pipeline. This
+    separate confirmation only removes the one-time lifecycle hold; actual cash
+    execution remains owned by the normal V7 decision flow.
+    """
+    ledger_path = Path(ledger_path)
+    confirmed_at = (generated_at or dt.datetime.now().astimezone()).isoformat(timespec="seconds")
+    with ledger_lock(ledger_path):
+        ledger = load_ledger(ledger_path)
+        if ledger.get("activation_status") != "ACTIVE":
+            raise ShadowRunError("NDX model is not active")
+        guard_status = ledger.get("first_activation_guard_status")
+        if not ledger.get("first_activation_guard") and guard_status == "CONFIRMED_MANUAL":
+            return ledger
+        if not ledger.get("first_activation_guard") or guard_status != "PENDING_MANUAL_CONFIRMATION":
+            raise ShadowRunError("first activation guard is not pending manual confirmation")
+        ledger.setdefault("activation_audit", []).append({
+            "activation_id": "ndx-v1-first-decision-confirmation-" + confirmed_at.replace(":", "").replace("+", "-"),
+            "model_version": MODEL_VERSION,
+            "previous_status": {
+                "activation_status": ledger.get("activation_status"),
+                "first_activation_guard": True,
+                "first_activation_guard_status": guard_status,
+            },
+            "new_status": {
+                "activation_status": "ACTIVE",
+                "first_activation_guard": False,
+                "first_activation_guard_status": "CONFIRMED_MANUAL",
+            },
+            "shadow_days": int(ledger.get("shadow_days_completed", 0) or 0),
+            "approved_time": confirmed_at,
+            "approved_by": confirmed_by,
+            "validation_result": "OFFLINE_PASS",
+            "decision_result": "NORMAL_DECISION_GATE_ENABLED",
+        })
+        ledger["first_activation_guard"] = False
+        ledger["first_activation_guard_status"] = "CONFIRMED_MANUAL"
+        ledger["first_activation_confirmed_at"] = confirmed_at
+        ledger["first_activation_confirmed_by"] = confirmed_by
+        # This ledger remains a shadow-governance record. Formal execution is
+        # still decided by the live V7 snapshot after this lifecycle gate opens.
+        ledger["updated_at"] = confirmed_at
+        ledger["ledger_sha256"] = _ledger_hash(ledger)
+        _atomic_write_json(ledger_path, ledger)
+        return ledger
+
+
 def canonical_shadow_view(report):
     """Read only governed fields. No legacy allocation fallback is permitted."""
     copilot = report.get("copilot")

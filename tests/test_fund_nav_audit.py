@@ -74,6 +74,28 @@ class FundNavAuditTests(unittest.TestCase):
         self.assertEqual(fund["data_lag_days"], 6)
         self.assertEqual(fund["lag_status"], "WARNING")
 
+    def test_zero_holding_execution_only_carrier_does_not_block_nav_audit(self):
+        self.config["funds"][0]["execution_only"] = True
+        result = data_layer_audit.audit_fund_nav(
+            self.conn, self.config, as_of=dt.date(2026, 6, 18)
+        )
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["funds"][0]["status"], "NOT_APPLICABLE")
+        self.assertEqual(result["blocking_issues"], [])
+        with tempfile.TemporaryDirectory() as directory:
+            data_layer_audit.write_phase1_reports(directory, result)
+
+    def test_execution_only_carrier_blocks_once_it_has_a_holding(self):
+        self.config["funds"][0].update({
+            "execution_only": True,
+            "holding_amount": 100,
+        })
+        result = data_layer_audit.audit_fund_nav(
+            self.conn, self.config, as_of=dt.date(2026, 6, 18)
+        )
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("000001:missing_raw_nav_series", result["blocking_issues"])
+
 
 if __name__ == "__main__":
     unittest.main()

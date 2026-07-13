@@ -424,16 +424,43 @@ def transparent_tags(carriers, asset_amount=0):
     return output
 
 
-def select_carriers(asset_allocated_amount, snapshot=None, config=None):
+def select_carriers(
+    asset_allocated_amount,
+    snapshot=None,
+    config=None,
+    include_non_holding_i_class=False,
+):
     amount = round(float(asset_allocated_amount or 0), 2)
     if amount < 0:
         raise ValueError("asset_allocated_amount不能小于0")
     snapshot = snapshot or read_snapshot()
     carriers = whitelist_carriers(snapshot, config=config)
-    ndx = [row for row in carriers if row.get("ndx_pool_eligible") and row.get("personal_purchase_supported")]
-    remaining, plan, candidates = amount, [], list(ndx)
+    ndx = [
+        row for row in carriers
+        if row.get("ndx_pool_eligible") and row.get("personal_purchase_supported")
+    ]
+    configured_codes = set(_holding_map(config)) if config is not None else None
+    copilot = (config or {}).get("copilot_v7", {})
+    approved_i_codes = {
+        str(code) for code in copilot.get("approved_i_class_carriers", [])
+    }
+    preferred_code = str(copilot.get("execution_funds", {}).get("us_equity", ""))
+    execution_eligible = [
+        row for row in ndx
+        if (configured_codes is None or row["fund_code"] in configured_codes)
+        and (
+            row.get("share_class") != "I"
+            or row.get("current_holding")
+            or row["fund_code"] in approved_i_codes
+            or include_non_holding_i_class
+        )
+    ]
+    remaining, plan, candidates = amount, [], list(execution_eligible)
     while candidates:
-        candidates.sort(key=lambda row: _rank_key(row, remaining))
+        candidates.sort(key=lambda row: (
+            0 if row["fund_code"] == preferred_code else 1,
+            _rank_key(row, remaining),
+        ))
         row = candidates.pop(0)
         capacity = float(row.get("effective_limit_rmb") or 0)
         planned = min(remaining, capacity)
@@ -441,12 +468,25 @@ def select_carriers(asset_allocated_amount, snapshot=None, config=None):
             plan.append({"fund_code": row["fund_code"], "fund_name": row["fund_name"],
                          "asset_class": "us_equity", "asset_name": "纳指指数型QDII",
                          "planned_amount": round(planned, 2), "carrier_capacity": capacity,
-                         "selection_reason": "已有持仓优先；单只覆盖优先；再比较跟踪误差、费率、额度稳定性和渠道"})
+                         "selection_reason": (
+                             "用户批准的NDX优先执行载体"
+                             if row["fund_code"] == preferred_code
+                             else "已有持仓优先；单只覆盖优先；再比较跟踪误差、费率、额度稳定性和渠道"
+                         )})
             remaining = round(remaining - planned, 2)
         if remaining <= 0:
             break
-    total_capacity = round(sum(float(row.get("effective_limit_rmb") or 0) for row in ndx), 2)
-    held_capacity = round(sum(float(row.get("effective_limit_rmb") or 0) for row in ndx if row.get("current_holding")), 2)
+    total_capacity = round(
+        sum(float(row.get("effective_limit_rmb") or 0) for row in execution_eligible),
+        2,
+    )
+    held_capacity = round(
+        sum(
+            float(row.get("effective_limit_rmb") or 0)
+            for row in execution_eligible if row.get("current_holding")
+        ),
+        2,
+    )
     snapshot_available = (
         snapshot.get("carrier_data_status") == "ACTIVE"
         and snapshot.get("carrier_selection_status") == "AVAILABLE"
@@ -460,7 +500,9 @@ def select_carriers(asset_allocated_amount, snapshot=None, config=None):
     for row in carriers:
         row["transparent_tags"] = tags.get(row["fund_code"], {"advantages": [], "risks": []})
     return {
-        "asset_allocated_amount": amount, "approved_carrier_count": len(ndx),
+        "asset_allocated_amount": amount,
+        "approved_carrier_count": len(ndx),
+        "execution_eligible_carrier_count": len(execution_eligible),
         "approved_total_capacity": total_capacity, "current_holding_carrier_capacity": held_capacity,
         "carrier_capacity_status": capacity_status, "remaining_unallocated_amount": max(0, remaining),
         "allocated_amount": round(amount - max(0, remaining), 2), "carrier_plan": plan,
@@ -468,7 +510,13 @@ def select_carriers(asset_allocated_amount, snapshot=None, config=None):
         "alternative_carriers": [], "all_carriers": carriers,
         "ndx_carriers": [row for row in carriers if row.get("ndx_pool_eligible")],
         "blocking_reasons": snapshot.get("blocking_reasons", []),
-        "warnings": ["019441当前额度较高，但近期在50元与10000元之间反复切换，执行前请再次确认渠道实际限额。"] if any(row.get("limit_volatility_flag") for row in ndx) else [],
+        "warnings": (
+            (["未获批准的I类基金不参与自动承接；未覆盖金额保留在Dynamic Cash Pool。"]
+             if any(row.get("share_class") == "I" for row in ndx)
+             and not approved_i_codes and not include_non_holding_i_class else [])
+            + (["019441当前额度较高，但近期在50元与10000元之间反复切换，执行前请再次确认渠道实际限额。"]
+               if any(row.get("limit_volatility_flag") for row in ndx) else [])
+        ),
     }
 
 
@@ -541,7 +589,7 @@ def calculate_multi_select(selected_allocations, asset_amount, carriers,
         preview_status = "EMPTY"
     elif (amount > tolerance and exact_match and not row_over_limit
           and not unselected_nonzero and snapshot_valid
-          and carrier_selection_status == "AVAILABLE"):
+          and carrier_selection_status in ("AVAILABLE", "PARTIAL_CAPACITY")):
         preview_status = "VALID"
     else:
         preview_status = "INVALID"
@@ -592,7 +640,6 @@ def integration_snapshot(asset_allocated_amount, path=DEFAULT_SNAPSHOT_PATH, now
     carrier_snapshot_valid = (
         snapshot.get("carrier_data_status") == "ACTIVE"
         and snapshot.get("carrier_selection_status") == "AVAILABLE"
-        and selection.get("carrier_capacity_status") == "AVAILABLE"
     )
     observed_capacity = float(selection.get("approved_total_capacity", 0) or 0)
     global_active = next((row for row in selection["all_carriers"] if row["fund_code"] == "270023"), None)
@@ -801,7 +848,8 @@ def apply_carrier_matching(ndx_candidate_release_amount, carrier_snapshot):
     candidate = max(0.0, float(ndx_candidate_release_amount or 0))
     carrier_available = bool(
         carrier_snapshot.get("carrier_snapshot_valid")
-        and carrier_snapshot.get("carrier_selection_status") == "AVAILABLE"
+        and carrier_snapshot.get("carrier_selection_status")
+        in ("AVAILABLE", "PARTIAL_CAPACITY")
     )
     last_known_capacity = max(0.0, float(
         carrier_snapshot.get("last_known_approved_carrier_capacity", 0) or 0

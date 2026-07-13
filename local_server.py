@@ -153,6 +153,7 @@ def validate_payload(payload, current):
             clean_manual[key] = round(value, 4)
         updated["copilot_v7"] = {
             "monthly_contribution": round(monthly, 2),
+            "approved_i_class_carriers": current_copilot["approved_i_class_carriers"],
             "execution_funds": current_copilot["execution_funds"],
             "release_rules": release_rules,
             "strategic_allocation": current_copilot["strategic_allocation"],

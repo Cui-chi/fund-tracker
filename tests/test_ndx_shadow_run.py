@@ -361,6 +361,54 @@ class NdxShadowRunTests(unittest.TestCase):
             self.assertEqual(final["next_status"],"MANUAL_ACTIVATION_REVIEW")
             self.assertTrue(final["ready_for_manual_activation_review"])
 
+    def test_41b_manual_activation_requires_completed_shadow(self):
+        with tempfile.TemporaryDirectory() as t:
+            r=Path(t); ledger=r/"ledger.json"; shadow.initialize_ledger(day0_report(r),ledger)
+            with self.assertRaises(shadow.ShadowRunError):
+                shadow.approve_manual_activation(ledger, approved_by="tester")
+
+    def test_41c_manual_activation_records_audit_without_releasing_cash(self):
+        with tempfile.TemporaryDirectory() as t:
+            r=Path(t); ledger=r/"ledger.json"; shadow.initialize_ledger(day0_report(r),ledger)
+            sessions = ("2026-06-22","2026-06-23","2026-06-24","2026-06-25","2026-06-26")
+            for index,session in enumerate(sessions,1): run_valid_day(r,ledger,session,"run-day%d" % index)
+            activated=shadow.approve_manual_activation(
+                ledger, approved_by="tester",
+                generated_at=dt.datetime(2026,6,27,9,0,tzinfo=NY))
+            self.assertEqual(activated["activation_status"],"ACTIVE")
+            self.assertEqual(activated["model_status"],"ACTIVE")
+            self.assertEqual(activated["decision_status"],"FREEZE")
+            self.assertEqual(activated["dynamic_cash_pool_status"],"FREEZE")
+            self.assertEqual(activated["shadow_days_completed"],shadow.REQUIRED_COMPLETE_DAYS)
+            self.assertEqual(len(activated["days"]),shadow.REQUIRED_COMPLETE_DAYS)
+            self.assertTrue(activated["first_activation_guard"])
+            self.assertEqual(activated["activation_audit"][-1]["decision_result"],"MANUAL_CONFIRMATION_REQUIRED")
+            self.assertEqual(shadow.load_ledger(ledger)["activation_status"],"ACTIVE")
+
+    def test_41d_manual_activation_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as t:
+            r=Path(t); ledger=r/"ledger.json"; shadow.initialize_ledger(day0_report(r),ledger)
+            sessions = ("2026-06-22","2026-06-23","2026-06-24","2026-06-25","2026-06-26")
+            for index,session in enumerate(sessions,1): run_valid_day(r,ledger,session,"run-day%d" % index)
+            first=shadow.approve_manual_activation(ledger, approved_by="tester")
+            second=shadow.approve_manual_activation(ledger, approved_by="tester")
+            self.assertEqual(len(first["activation_audit"]),len(second["activation_audit"]))
+
+    def test_41e_first_activation_confirmation_is_audited_without_releasing_cash(self):
+        with tempfile.TemporaryDirectory() as t:
+            r=Path(t); ledger=r/"ledger.json"; shadow.initialize_ledger(day0_report(r),ledger)
+            sessions = ("2026-06-22","2026-06-23","2026-06-24","2026-06-25","2026-06-26")
+            for index,session in enumerate(sessions,1): run_valid_day(r,ledger,session,"run-day%d" % index)
+            shadow.approve_manual_activation(ledger, approved_by="activator")
+            confirmed=shadow.confirm_first_activation_guard(
+                ledger, confirmed_by="reviewer",
+                generated_at=dt.datetime(2026,6,27,10,0,tzinfo=NY))
+            self.assertFalse(confirmed["first_activation_guard"])
+            self.assertEqual(confirmed["first_activation_guard_status"], "CONFIRMED_MANUAL")
+            self.assertEqual(confirmed["decision_status"], "FREEZE")
+            self.assertEqual(confirmed["dynamic_cash_pool_status"], "FREEZE")
+            self.assertEqual(confirmed["activation_audit"][-1]["decision_result"], "NORMAL_DECISION_GATE_ENABLED")
+
     def test_42_primary_gate_ready_when_primary_date_reaches_target(self):
         data={"trade_date":"2026-06-23","price_primary":{"source":"FRED_NASDAQ100","instrument":"NDX","date":"2026-06-23","close":30000.0},"price_validators":[]}
         self.assertEqual(shadow.evaluate_primary_shadow_gate(data, dt.date(2026,6,23))["decision"], "READY")

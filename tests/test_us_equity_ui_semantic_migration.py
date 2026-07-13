@@ -86,10 +86,19 @@ class UsEquityUiSemanticMigrationTests(unittest.TestCase):
         self.assertIn("单只可覆盖", tags["A"]["advantages"])
         self.assertNotIn("单只可覆盖", tags["B"]["advantages"])
 
-    def test_freeze_and_execution_controls(self):
-        self.assertIn("Current Decision: 0 元", self.html)
-        self.assertIn("当前FREEZE，执行确认不可用", self.html)
-        self.assertIn('disabled aria-disabled="true"', self.html)
+    def test_execution_controls_follow_live_cash_pool_status(self):
+        if 'data-cash-pool-status="FREEZE"' in self.html:
+            self.assertIn("Current Decision: 0 元", self.html)
+            self.assertIn("执行已禁用", self.html)
+            self.assertIn('disabled aria-disabled="true"', self.html)
+        else:
+            self.assertIn('data-cash-pool-status="EXECUTE"', self.html)
+            self.assertIn("本月动态资金释放方向", self.html)
+            self.assertIn("ACTIVE · 已进入正式决策", self.html)
+            self.assertIn("执行本月方案", self.html)
+            self.assertIn("确认执行并入账", self.html)
+        self.assertIn("此区域仅用于载体能力预览，不执行、不入账", self.html)
+        self.assertNotIn('id="qdii-execute-button"', self.html)
         # 页头「Historical Executed Amount」是当月状态，跨月会归零；已执行月份的
         # 历史事实按「执行流水不可变」锁定在月度执行历史表里，断言应指向那条记录。
         self.assertRegex(

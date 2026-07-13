@@ -322,7 +322,7 @@ def calculate_asset_level_status(evaluated_indicators):
         elif fallback_warning:
             data_status = "WARNING"
             execution_status = "ELIGIBLE"
-            reason = "A股价格温度降级为releaseFactor=1.0；仅停用温度调整，不阻断战略缺口执行"
+            reason = "A股价格温度存在数据WARNING；保留当前有效释放系数，不阻断战略缺口执行"
         else:
             data_status = "PASS"
             execution_status = "ELIGIBLE"

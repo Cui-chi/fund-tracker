@@ -82,6 +82,42 @@ class QdiiCarrierIntegrationTests(unittest.TestCase):
         result = qdii_carrier.select_carriers(40, snapshot_payload(), self.config)
         self.assertEqual(result["recommended_carrier"]["fund_code"], "539001")
 
+    def test_auto_plan_excludes_unconfigured_i_class_and_retains_remainder(self):
+        payload = snapshot_payload()
+        payload["carrier_data_status"] = "ACTIVE"
+        payload["carrier_selection_status"] = "AVAILABLE"
+        result = qdii_carrier.select_carriers(400, payload, self.config)
+        self.assertEqual([row["fund_code"] for row in result["carrier_plan"]], ["539001"])
+        self.assertEqual(result["allocated_amount"], 100)
+        self.assertEqual(result["remaining_unallocated_amount"], 300)
+        self.assertEqual(result["carrier_capacity_status"], "PARTIAL_CAPACITY")
+        self.assertTrue(any("未获批准的I类基金不参与" in row for row in result["warnings"]))
+
+    def test_explicitly_approved_i_class_is_preferred_for_current_plan(self):
+        payload = snapshot_payload()
+        payload["carrier_data_status"] = "ACTIVE"
+        payload["carrier_selection_status"] = "AVAILABLE"
+        approved = {"copilot_v7": {
+            "approved_i_class_carriers": ["021000"],
+            "execution_funds": {"us_equity": "021000"},
+        }, "funds": self.config["funds"] + [
+            {"code": "021000", "holding_amount": 0},
+        ]}
+        result = qdii_carrier.select_carriers(400, payload, approved)
+        self.assertEqual(result["carrier_plan"][0]["fund_code"], "021000")
+        self.assertEqual(result["carrier_plan"][0]["planned_amount"], 400)
+        self.assertEqual(result["remaining_unallocated_amount"], 0)
+
+    def test_partial_capacity_is_coverable_without_becoming_a_carrier_block(self):
+        result = qdii_carrier.apply_carrier_matching(400, {
+            "carrier_snapshot_valid": True,
+            "carrier_selection_status": "PARTIAL_CAPACITY",
+            "last_known_approved_carrier_capacity": 100,
+        })
+        self.assertEqual(result["carrier_coverable_amount"], 100)
+        self.assertEqual(result["retained_due_to_capacity"], 300)
+        self.assertEqual(result["retained_due_to_carrier_block"], 0)
+
     def test_single_cover_tag(self):
         rows = qdii_carrier.whitelist_carriers(snapshot_payload(), self.config)
         tags = qdii_carrier.transparent_tags(rows, 625)
@@ -136,13 +172,14 @@ class QdiiCarrierIntegrationTests(unittest.TestCase):
         self.assertEqual(config["copilot_v7"]["strategic_allocation"], {"a_share": .4, "us_equity": .4, "gold": .1, "cash": .1})
         self.assertEqual(next(item for item in config["funds"] if item["code"] == "270023")["weekly_auto_invest"], 100.0)
 
-    def test_dynamic_cash_pool_remains_freeze(self):
+    def test_snapshot_generation_does_not_change_dynamic_cash_pool(self):
         config = fund_tracker.load_config(); conn = fund_tracker.connect_db()
         try:
+            before = fund_tracker.get_state(conn, "dynamic_cash_pool", 0)
             snapshot = fund_tracker.generate_copilot_snapshot(conn, config, fund_tracker.generate_market_temperature(conn, config))
             self.assertEqual(snapshot["legacy_us_equity_score_status"], "RETIRED")
-            self.assertEqual(snapshot["decision_status"], "FREEZE")
-            self.assertFalse(snapshot["allow_auto_execution"])
+            self.assertIn(snapshot["decision_status"], ("FREEZE", "EXECUTE"))
+            self.assertEqual(fund_tracker.get_state(conn, "dynamic_cash_pool", 0), before)
             conn.rollback()
         finally:
             conn.close()

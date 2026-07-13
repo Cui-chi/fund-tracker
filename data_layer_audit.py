@@ -55,6 +55,10 @@ def audit_fund_nav(conn, config, as_of=None):
     blocking_issues = []
     for fund in config["funds"]:
         code = fund["code"]
+        execution_only_without_holding = bool(
+            fund.get("execution_only")
+            and float(fund.get("holding_amount", 0) or 0) <= 0
+        )
         db_rows = conn.execute(
             """
             SELECT code, nav_date, nav, accumulated_nav, source, source_url,
@@ -80,8 +84,11 @@ def audit_fund_nav(conn, config, as_of=None):
         is_qdii = "QDII" in fund.get("type", "").upper()
         issues = []
         if not rows:
-            issues.append("missing_raw_nav_series")
-            blocking_issues.append(f"{code}:missing_raw_nav_series")
+            if execution_only_without_holding:
+                issues.append("execution_only_without_holding")
+            else:
+                issues.append("missing_raw_nav_series")
+                blocking_issues.append(f"{code}:missing_raw_nav_series")
             missing = {
                 "fund_code": code,
                 "fund_name": fund["name"],
@@ -91,7 +98,7 @@ def audit_fund_nav(conn, config, as_of=None):
                 "is_qdii": is_qdii,
                 "data_lag_days": None,
                 "qdii_lag_status": "FAIL" if is_qdii else "NOT_APPLICABLE",
-                "status": "FAIL",
+                "status": "NOT_APPLICABLE" if execution_only_without_holding else "FAIL",
                 "issues": issues,
             }
             for label in ("6m", "12m"):
@@ -185,9 +192,11 @@ def write_phase1_reports(base_dir, result):
         "|---|---|---|---|---:|---:|---:|---|---:|---|",
     ]
     for fund in result["funds"]:
+        latest_nav = fund.get("latest_nav")
+        latest_nav_text = "N/A" if latest_nav is None else f"{latest_nav:.4f}"
         nav_lines.append(
             f"| {fund['fund_code']} | {fund['fund_name']} | {fund.get('source', 'N/A')} | "
-            f"{fund.get('latest_nav_date', 'N/A')} | {fund.get('latest_nav', 0):.4f} | {fund['is_qdii']} | "
+            f"{fund.get('latest_nav_date') or 'N/A'} | {latest_nav_text} | {fund['is_qdii']} | "
             f"{fund.get('data_lag_days', 'N/A')} | {fund.get('qdii_lag_status', 'N/A')} | "
             f"{fund.get('raw_sample_size', 0)} | "
             f"{fund['status']} |"
