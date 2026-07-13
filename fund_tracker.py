@@ -4219,6 +4219,11 @@ def validate_fund_executions(
     return executions
 
 
+def integer_execution_amount(amount):
+    """Return the largest whole-yuan amount that stays within a plan."""
+    return max(0, int(float(amount or 0)))
+
+
 def apply_copilot_decision(conn, config, decision, fund_executions=None):
     if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
@@ -5998,9 +6003,9 @@ def write_copilot_dashboard(
           <td>{html.escape(row['asset_name'])}</td>
           <td>{float(row['planned_amount']):,.2f}</td>
           <td><input class="fund-actual" type="number" min="0"
-            max="{float(row['planned_amount']):.2f}" step="0.01"
+            max="{integer_execution_amount(row['planned_amount'])}" step="1"
             data-fund-code="{html.escape(row['fund_code'])}"
-            value="{float(row['planned_amount']):.2f}" {'disabled aria-disabled="true"' if execution_disabled else ''}></td>
+            value="{integer_execution_amount(row['planned_amount'])}" {'disabled aria-disabled="true"' if execution_disabled else ''}></td>
         </tr>
         """
         for row in carrier_plan
@@ -6008,6 +6013,10 @@ def write_copilot_dashboard(
     executable_fund_plan_amount = round(sum(
         float(row.get("planned_amount", 0) or 0) for row in carrier_plan
     ), 2)
+    integer_executable_amount = sum(
+        integer_execution_amount(row.get("planned_amount", 0))
+        for row in carrier_plan
+    )
 
     disabled = execution_disabled or status != "pending" or plan_amount <= 0
     pool_note_html = (
@@ -6824,7 +6833,7 @@ def write_copilot_dashboard(
         <thead><tr><th>基金</th><th>资产</th><th>计划金额</th><th>实际金额</th></tr></thead>
         <tbody>{modal_rows}</tbody>
       </table>
-      <div class="modal-total">当前可执行合计 <strong id="execution-total">{executable_fund_plan_amount:,.2f}</strong> 元</div>
+      <div class="modal-total">当前整数执行合计 <strong id="execution-total">{integer_executable_amount:,.0f}</strong> 元</div>
       <div class="button-row">
         <button type="button" class="primary" id="execution-confirm">确认执行并入账</button>
         <button type="button" class="secondary" id="execution-cancel-bottom">取消</button>
