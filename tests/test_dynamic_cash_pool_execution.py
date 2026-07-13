@@ -2,6 +2,8 @@ import copy
 import json
 import sqlite3
 import unittest
+
+import fund_tracker
 from unittest import mock
 
 import fund_tracker
@@ -85,6 +87,15 @@ def snapshot():
 
 
 class DynamicCashPoolExecutionTests(unittest.TestCase):
+    def test_execution_amount_defaults_to_whole_yuan_without_exceeding_plan(self):
+        self.assertEqual(fund_tracker.integer_execution_amount(250.54), 250)
+        self.assertEqual(fund_tracker.integer_execution_amount(424.21), 424)
+        self.assertEqual(
+            fund_tracker.integer_execution_amount(250.54)
+            + fund_tracker.integer_execution_amount(424.21),
+            674,
+        )
+
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         schema(self.conn)
