@@ -198,5 +198,94 @@ class ValidatePayloadOptionalHoldingTests(unittest.TestCase):
         self.assertEqual(fund_by_code(updated, "022459")["max_holding_amount"], 30000.0)
 
 
+class ApplyPortfolioCreateTests(unittest.TestCase):
+    def setUp(self):
+        self.config = copy.deepcopy(BASE_CONFIG)
+
+    def _create(self, config, **holding):
+        payload = {"action": "create", "holding": holding}
+        return local_server.apply_portfolio_create(config, payload, now_iso=NOW)
+
+    def test_creates_new_a_share_holding_with_defaults(self):
+        updated, last = self._create(
+            self.config, code="008888", name="新A股基金",
+            asset_class="a_share", holding_amount=5000, profit_pct=None)
+        new = fund_by_code(updated, "008888")
+        self.assertEqual((new["name"], new["asset_class"], new["holding_amount"]),
+                         ("新A股基金", "a_share", 5000.00))
+        self.assertIsNone(new["profit_pct"])
+        self.assertEqual(new["holding_updated_at"], NOW)
+        self.assertEqual(last, NOW)
+        # sync_funds reads these directly — must be present.
+        self.assertEqual(new["type"], "A股")
+        self.assertEqual(new["max_holding_amount"], 0.0)
+        self.assertEqual(len(updated["funds"]), len(BASE_CONFIG["funds"]) + 1)
+
+    def test_creates_overseas_equity_holding(self):
+        updated, _ = self._create(
+            self.config, code="270023", name="广发全球精选",
+            asset_class="us_equity", holding_amount=5000)
+        self.assertEqual(fund_by_code(updated, "270023")["asset_class"], "us_equity")
+        self.assertEqual(fund_by_code(updated, "270023")["type"], "海外权益")
+
+    def test_duplicate_code_is_rejected_and_original_untouched(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._create(self.config, code="022459", name="想覆盖",
+                         asset_class="a_share", holding_amount=1)
+        self.assertIn("已存在", str(ctx.exception))
+        self.assertEqual(fund_by_code(self.config, "022459")["holding_amount"], 12097.68)
+        self.assertEqual(fund_by_code(self.config, "022459")["name"], "易方达中证A500ETF联接A")
+
+    def test_code_is_stripped(self):
+        updated, _ = self._create(self.config, code="  009999  ", name="去空格",
+                                  asset_class="gold", holding_amount=10)
+        self.assertIn("009999", [f["code"] for f in updated["funds"]])
+
+    def test_empty_code_rejected(self):
+        with self.assertRaises(ValueError):
+            self._create(self.config, code="   ", name="无码", asset_class="a_share", holding_amount=1)
+
+    def test_empty_name_rejected(self):
+        with self.assertRaises(ValueError):
+            self._create(self.config, code="008888", name="  ", asset_class="a_share", holding_amount=1)
+
+    def test_invalid_asset_class_rejected(self):
+        with self.assertRaises(ValueError):
+            self._create(self.config, code="008888", name="X", asset_class="其他", holding_amount=1)
+
+    def test_empty_amount_rejected(self):
+        with self.assertRaises(ValueError):
+            self._create(self.config, code="008888", name="X", asset_class="a_share", holding_amount="")
+
+    def test_negative_amount_rejected(self):
+        with self.assertRaises(ValueError):
+            self._create(self.config, code="008888", name="X", asset_class="a_share", holding_amount=-1)
+
+    def test_blank_profit_becomes_null(self):
+        for blank in ("", None):
+            cfg = copy.deepcopy(BASE_CONFIG)
+            updated, _ = self._create(cfg, code="008888", name="X",
+                                      asset_class="a_share", holding_amount=1, profit_pct=blank)
+            self.assertIsNone(fund_by_code(updated, "008888")["profit_pct"])
+
+    def test_profit_below_minus_100_rejected(self):
+        with self.assertRaises(ValueError):
+            self._create(self.config, code="008888", name="X",
+                         asset_class="a_share", holding_amount=1, profit_pct=-150)
+
+    def test_does_not_touch_other_funds_or_cash(self):
+        updated, _ = self._create(self.config, code="008888", name="X",
+                                  asset_class="a_share", holding_amount=1)
+        self.assertEqual(updated["cash_available"], BASE_CONFIG["cash_available"])
+        self.assertNotIn("cash_updated_at", updated)
+        self.assertEqual(fund_by_code(updated, "014661")["holding_amount"], 8002.3)
+
+    def test_edit_path_never_creates_on_unknown_code(self):
+        # /api/portfolio edit path must still reject an unknown code, not create.
+        with self.assertRaises(ValueError):
+            local_server.apply_portfolio_update(
+                self.config, {"holdings": [{"code": "000000", "holding_amount": 1}]}, now_iso=NOW)
+
+
 if __name__ == "__main__":
     unittest.main()

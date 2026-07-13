@@ -7122,7 +7122,10 @@ def write_copilot_dashboard(
               <span class="eyebrow">Portfolio Management</span>
               <h2>持仓管理</h2>
             </div>
-            <span class="pm-last-updated">最后持仓更新时间：{pm_last_updated_text}</span>
+            <div class="pm-head-actions">
+              <button type="button" class="pm-add" data-pm-add>+ 新增持仓</button>
+              <span class="pm-last-updated">最后持仓更新时间：{pm_last_updated_text}</span>
+            </div>
           </div>
           <p class="muted" style="margin:4px 0 0;font-size:12px;">所有当前持仓金额的唯一编辑入口。修改金额只参与配置与缺口重算，不改动基金净值、历史回撤、历史执行、历史收益、模型评分与 Shadow Run。</p>
           <table style="margin-top:12px;">
@@ -7144,7 +7147,23 @@ def write_copilot_dashboard(
         </div>
         <button class="modal-close" type="button" data-pm-close>关闭</button>
       </div>
-      <label style="display:block;margin-top:14px;font-size:12px;color:var(--muted);">当前持仓金额（元）
+      <div id="pm-create-fields" style="display:none;">
+        <label style="display:block;margin-top:14px;font-size:12px;color:var(--muted);">基金代码
+          <input type="text" id="pm-code" autocomplete="off" style="width:100%;margin-top:6px;padding:10px;border:1px solid var(--line);border-radius:8px;font:inherit;">
+        </label>
+        <label style="display:block;margin-top:12px;font-size:12px;color:var(--muted);">基金名称
+          <input type="text" id="pm-name" autocomplete="off" style="width:100%;margin-top:6px;padding:10px;border:1px solid var(--line);border-radius:8px;font:inherit;">
+        </label>
+        <label style="display:block;margin-top:12px;font-size:12px;color:var(--muted);">资产类别
+          <select id="pm-asset-class" style="width:100%;margin-top:6px;padding:10px;border:1px solid var(--line);border-radius:8px;font:inherit;background:var(--panel);">
+            <option value="a_share">A股</option>
+            <option value="us_equity">海外权益</option>
+            <option value="gold">黄金</option>
+            <option value="cash">现金及低风险</option>
+          </select>
+        </label>
+      </div>
+      <label id="pm-amount-field" style="display:block;margin-top:14px;font-size:12px;color:var(--muted);">当前持仓金额（元）
         <input type="number" id="pm-amount" min="0" step="0.01" inputmode="decimal" style="width:100%;margin-top:6px;padding:10px;border:1px solid var(--line);border-radius:8px;font:inherit;">
       </label>
       <label id="pm-profit-field" style="display:block;margin-top:12px;font-size:12px;color:var(--muted);">当前盈亏（%，可负、可留空）
@@ -7168,6 +7187,10 @@ def write_copilot_dashboard(
       var amountEl = document.getElementById('pm-amount');
       var profitEl = document.getElementById('pm-profit');
       var profitField = document.getElementById('pm-profit-field');
+      var createFields = document.getElementById('pm-create-fields');
+      var codeEl = document.getElementById('pm-code');
+      var nameEl = document.getElementById('pm-name');
+      var assetClassEl = document.getElementById('pm-asset-class');
       var errEl = document.getElementById('pm-error');
       var saveBtn = document.getElementById('pm-save');
       var toastEl = document.getElementById('pm-toast');
@@ -7177,9 +7200,11 @@ def write_copilot_dashboard(
                   'decision-status','portfolio-table'];
 
       function openModal(btn) {
-        current = { type: btn.getAttribute('data-pm-type'), code: btn.getAttribute('data-pm-code') || '',
+        current = { mode: 'edit', type: btn.getAttribute('data-pm-type'),
+                    code: btn.getAttribute('data-pm-code') || '',
                     name: btn.getAttribute('data-pm-name') || '' };
         var isCash = current.type === 'cash';
+        createFields.style.display = 'none';
         titleEl.textContent = isCash ? '编辑现金金额' : '编辑持仓';
         subEl.textContent = current.name + (current.code ? ' · ' + current.code : '');
         amountEl.value = Number(btn.getAttribute('data-pm-amount') || 0).toFixed(2);
@@ -7192,12 +7217,29 @@ def write_copilot_dashboard(
         modal.classList.add('open'); modal.setAttribute('aria-hidden', 'false');
         amountEl.focus(); amountEl.select();
       }
+      function openCreateModal() {
+        current = { mode: 'create', type: 'fund' };
+        createFields.style.display = 'block';
+        titleEl.textContent = '新增持仓';
+        subEl.textContent = '手动录入一笔新持仓，仅参与配置与缺口重算';
+        codeEl.value = ''; nameEl.value = ''; assetClassEl.value = 'a_share';
+        amountEl.value = ''; profitEl.value = '';
+        profitField.style.display = 'block';
+        errEl.textContent = '';
+        modal.classList.add('open'); modal.setAttribute('aria-hidden', 'false');
+        codeEl.focus();
+      }
       function closeModal() { modal.classList.remove('open'); modal.setAttribute('aria-hidden', 'true'); current = null; }
       function showToast(msg) {
         toastEl.textContent = msg; toastEl.classList.add('show');
         setTimeout(function() { toastEl.classList.remove('show'); }, 2600);
       }
       function validate() {
+        if (current && current.mode === 'create') {
+          if (codeEl.value.trim() === '') return '基金代码不能为空';
+          if (nameEl.value.trim() === '') return '基金名称不能为空';
+          if (['a_share','us_equity','gold','cash'].indexOf(assetClassEl.value) < 0) return '请选择资产类别';
+        }
         var raw = amountEl.value;
         if (raw === null || String(raw).trim() === '') return '金额不能为空';
         var n = Number(raw);
@@ -7233,7 +7275,13 @@ def write_copilot_dashboard(
         if (err) { errEl.textContent = err; return; }
         var amount = Math.round(Number(amountEl.value) * 100) / 100;
         var body;
-        if (current.type === 'cash') {
+        if (current.mode === 'create') {
+          var cp = profitEl.value.trim();
+          body = { action: 'create', holding: {
+            code: codeEl.value.trim(), name: nameEl.value.trim(),
+            asset_class: assetClassEl.value, holding_amount: amount,
+            profit_pct: (cp === '' ? null : Number(cp)) } };
+        } else if (current.type === 'cash') {
           body = { cash_available: amount };
         } else {
           var p = profitEl.value.trim();
@@ -7259,6 +7307,8 @@ def write_copilot_dashboard(
 
       document.addEventListener('click', function(e) {
         var t = e.target;
+        var addBtn = t.closest ? t.closest('[data-pm-add]') : null;
+        if (addBtn) { e.preventDefault(); openCreateModal(); return; }
         var editBtn = t.closest ? t.closest('[data-pm-edit]') : null;
         if (editBtn) { e.preventDefault(); openModal(editBtn); return; }
         if (t.closest && t.closest('[data-pm-close]')) { closeModal(); return; }
@@ -7547,6 +7597,10 @@ def write_copilot_dashboard(
 
     /* ===== Portfolio Management (持仓管理) ===== */
     .pm-head {{ display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px; }}
+    .pm-head-actions {{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; }}
+    .pm-add {{ border:0; background:var(--navy); color:#fff; border-radius:8px; padding:8px 14px;
+      font:inherit; font-size:13px; font-weight:700; cursor:pointer; box-shadow:0 2px 8px rgba(23,32,51,.18); }}
+    .pm-add:hover {{ background:#0f1626; }}
     .pm-last-updated {{ font-size:12px; color:var(--muted); white-space:nowrap; }}
     .pm-amount-cell {{ font-weight:700; }}
     .pm-updated {{ color:var(--muted); font-size:12px; }}
@@ -7643,8 +7697,9 @@ def write_copilot_dashboard(
 
     <nav class="tab-nav" role="tablist">
       <button class="tab-btn active" role="tab" aria-selected="true" data-tab="overview">总览</button>
-      <button class="tab-btn" role="tab" aria-selected="false" data-tab="daily-automation">每日自动化</button>
-      <button class="tab-btn" role="tab" aria-selected="false" data-tab="automation-history">自动化历史</button>
+      <!-- 一级导航暂隐：如需恢复「每日自动化」「自动化历史」入口，删除下两行的 style="display:none" 即可（页面结构/数据/代码均保留）。 -->
+      <button class="tab-btn" role="tab" aria-selected="false" data-tab="daily-automation" style="display:none">每日自动化</button>
+      <button class="tab-btn" role="tab" aria-selected="false" data-tab="automation-history" style="display:none">自动化历史</button>
       <button class="tab-btn" role="tab" aria-selected="false" data-tab="portfolio">持仓管理</button>
       <button class="tab-btn" role="tab" aria-selected="false" data-tab="drawdown">基金回撤</button>
       <button class="tab-btn" role="tab" aria-selected="false" data-tab="allocation-flow">配置与资金流</button>

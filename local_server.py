@@ -270,6 +270,64 @@ def apply_portfolio_update(current, payload, now_iso=None):
     return updated, portfolio_last_updated(updated)
 
 
+_ASSET_CLASS_LABELS = {
+    "a_share": "A股", "us_equity": "海外权益", "gold": "黄金", "cash": "现金及低风险",
+}
+
+
+def apply_portfolio_create(current, payload, now_iso=None):
+    """Create one new holding from Portfolio Management.
+
+    Reuses the existing fund JSON structure and persistence (config.json). Does
+    not touch any other fund, the manual cash record, NAV/drawdown history, or
+    execution records. Returns ``(updated_config, last_updated_iso)`` and raises
+    ``ValueError`` on bad or duplicate input.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("请求格式不正确")
+    holding = payload.get("holding")
+    if not isinstance(holding, dict):
+        raise ValueError("新增持仓数据格式不正确")
+    now_iso = now_iso or now_local_iso()
+
+    code = str(holding.get("code", "")).strip()
+    if not code:
+        raise ValueError("基金代码不能为空")
+    name = str(holding.get("name", "")).strip()
+    if not name:
+        raise ValueError("基金名称不能为空")
+    asset_class = str(holding.get("asset_class", "")).strip()
+    if asset_class not in ASSET_CLASSES:
+        raise ValueError("资产类别不正确")
+    amount = _coerce_amount(holding.get("holding_amount"), "持仓金额")
+    profit = _coerce_profit(holding.get("profit_pct"))
+
+    funds = [dict(fund) for fund in current.get("funds", [])]
+    if any(str(fund.get("code")) == code for fund in funds):
+        raise ValueError("该基金代码已存在，请直接编辑已有持仓。")
+
+    # Reuse the existing fund structure with safe defaults so the whole config
+    # pipeline (sync_funds reads type/max_holding_amount directly) never breaks.
+    funds.append({
+        "code": code,
+        "name": name,
+        "asset_class": asset_class,
+        "type": _ASSET_CLASS_LABELS.get(asset_class, asset_class),
+        "holding_amount": amount,
+        "profit_pct": profit,
+        "strategy": "无",
+        "daily_auto_invest": 0.0,
+        "weekly_auto_invest": 0.0,
+        "max_holding_amount": 0.0,
+        "drawdown_20_buy_amount": 0.0,
+        "drawdown_30_buy_amount": 0.0,
+        "holding_updated_at": now_iso,
+    })
+    updated = dict(current)
+    updated["funds"] = funds
+    return updated, portfolio_last_updated(updated)
+
+
 def rebuild_outputs(config, phase="local-rebuild"):
     run_dir = output_paths.create_run_dir(phase, force_new=True)
     conn = fund_tracker.connect_db()
@@ -460,12 +518,19 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             if self.path == "/api/portfolio":
                 current = load_config()
-                updated, last_updated = apply_portfolio_update(current, payload)
+                # Request must explicitly opt into create; edit stays the default
+                # so a mistyped code never silently creates a new holding.
+                if isinstance(payload, dict) and payload.get("action") == "create":
+                    updated, last_updated = apply_portfolio_create(current, payload)
+                    message = "新增持仓成功"
+                else:
+                    updated, last_updated = apply_portfolio_update(current, payload)
+                    message = "持仓金额已更新"
                 save_config(updated)
                 rebuild_outputs(updated)
                 self.send_json({
                     "ok": True,
-                    "message": "持仓金额已更新",
+                    "message": message,
                     "last_updated": last_updated,
                 })
                 return
