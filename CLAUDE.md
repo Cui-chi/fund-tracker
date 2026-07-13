@@ -29,7 +29,7 @@ python3 local_server.py
 #   http://127.0.0.1:8765/dashboard.html
 #   http://127.0.0.1:8765/settings.html
 
-# 测试（pytest 7.x，约 272 个 unittest 风格用例，必须从项目根运行）
+# 测试（pytest 7.x，约 377 个 unittest 风格用例，必须从项目根运行）
 python3 -m pytest tests/
 python3 -m pytest tests/test_ndx_shadow_run.py                       # 单文件
 python3 -m pytest tests/test_decision_snapshot.py::ClassName::test_x  # 单用例
@@ -80,11 +80,13 @@ load_config() → connect_db() → sync_funds()
 
 **评分语义不变量（贯穿全仓库）：分数越高 = 当下越值得新增配置。** 因此高实际利率 / 高政策利率会*降低*黄金分数，通胀预期会*提高*它。任何新评分必须遵守这个方向，否则会与既有路由逻辑冲突。
 
-### NDX V1 影子运行（当前活跃工作，分支 `codex/ndx-v1-shadow-run`）
+### NDX V1 影子运行与激活（已于 2026-07 完成 5/5 影子验证并激活）
 
-- `ndx_shadow_run.py` — 受治理的五会话（5 个完整美股交易日）状态机，`REQUIRED_COMPLETE_DAYS = 5`，账本 schema `ndx-shadow-ledger-v1`。
-- `scripts/run_ndx_shadow_daily.py` — 每日 13:10（SGT）编排器：检查 FRED 新鲜度（`NASDAQ100`、`DFII10`）、就绪时刷新本地 CSV、写一条 SLA 账本、再委托 `scripts/run_ndx_shadow.py`。**它不改 NDX 公式。** 影子日执行成功后会额外触发一次轻量 dashboard 重渲染（复用 `local_server.rebuild_outputs()`，不重新抓取 NAV/宏观/估值数据），让首页 Shadow Day X/Y 与 Today's Focus 不必等到次日 09:10 才刷新；该刷新是尽力而为（best-effort），失败不影响已记录的影子成功与账本。
+- `ndx_shadow_run.py` — 受治理的五会话（5 个完整美股交易日）状态机，`REQUIRED_COMPLETE_DAYS = 5`，账本 schema `ndx-shadow-ledger-v1`。`approve_manual_activation()` 是唯一的人工激活入口：要求账本已 `SHADOW_COMPLETE` 且天数达标，写入 `activation_status=ACTIVE` 与 `activation_audit`，**但同时把 `first_activation_guard=True` / `first_activation_guard_status=PENDING_MANUAL_CONFIRMATION` 写进账本**——激活本身不等于允许正式放钱。
+- `fund_tracker.py:ndx_activation_gate_status()` 是正式决策是否能打开的唯一闸门：读账本的 `activation_status` + `first_activation_guard`，只要 guard 处于 `PENDING_MANUAL_CONFIRMATION` 就返回 `allow_formal_decision=False`（`first_activation_confirmation_required=True`）。**这个闸门曾经存在过"只记录不强制"的漏洞（激活后首个快照直接进 EXECUTE 并给出非零释放金额），已在 `525e42e` 修复**——任何改动 NDX 决策链的代码都必须保证 `generate_copilot_snapshot` 走这个函数而不是绕过它。
+- `scripts/run_ndx_shadow_daily.py` — 每日 13:10（SGT）编排器：检查 FRED 新鲜度（`NASDAQ100`、`DFII10`）、就绪时刷新本地 CSV、写一条 SLA 账本、再委托 `scripts/run_ndx_shadow.py`。**它不改 NDX 公式。** 影子日执行成功后会额外触发一次轻量 dashboard 重渲染（复用 `local_server.rebuild_outputs()`，不重新抓取 NAV/宏观/估值数据），让首页 Shadow Day X/Y 与 Today's Focus 不必等到次日 09:10 才刷新；该刷新是尽力而为（best-effort），失败不影响已记录的影子成功与账本，且**必须在 SLA 记录写盘之后再触发**（曾经顺序反了，导致刚跑完的当日在自动化历史里被误判成「电脑离线」，已修复）。
 - 价格来源遵循 SSOT（单一可信源），DFII10 作为宏观输入需与模型 as-of 日期对齐（见近期 commit）。
+- `daily_automation_status.py` — 纯函数、可测的中文状态映射层（「每日自动化」「自动化历史」两个 Tab 用），把 `SHADOW_EXECUTED`/`SHADOW_FAILED`/`FREEZE` 等英文枚举翻译成统一中文状态（含颜色、是否异常、是否影响 Graduation/DCP）。只读账本/SLA/prepared 产物，不做任何计算或改动。这两个 Tab 目前在导航里被 `style="display:none"` 隐藏（见下文本地服务小节），代码与数据均保留。
 
 ### 输出路径纪律（`utils/output_paths.py` — 输出路径的 SSOT）
 
@@ -107,6 +109,10 @@ load_config() → connect_db() → sync_funds()
 
 `local_server.py`（裸 `http.server`）提供 `dashboard.html`、`settings.html`。配置页保存即写回 `config.json` 并同步数据库、刷新监控页。`config.json` 是基金清单、持仓、仓位上限、回撤补仓档、V7 战略配置（`copilot_v7`）与市场温度数据源的真相源。
 
+- **持仓管理（Portfolio Management）** 是持仓金额的唯一编辑/新增入口，走 `POST /api/portfolio`：请求体带 `"action": "create"` → `apply_portfolio_create()`（新增，代码查重、必填校验、资产类别限定四选一）；不带则走 `apply_portfolio_update()`（编辑，未知代码直接报错、绝不静默新增）。新增的持仓复用现有 fund JSON 结构（`type`/`max_holding_amount` 等填安全默认值，避免 `sync_funds` 因缺字段崩溃）。
+- 一级导航里的「每日自动化」「自动化历史」两个 Tab 当前用 `style="display:none"` 隐藏（页面结构、数据、`daily_automation_status.py` 均未删除），需要排查自动化问题时删掉这行内联样式即可恢复入口。
+- **改了 `local_server.py` 后必须重启常驻进程才会生效**（Python 不热加载源码；launchd 配置了 `com.codex.fund-tracker`，`kill` 掉旧 PID 后会自动重启到新代码）。只改 `fund_tracker.py` 的渲染逻辑、需要看到效果时同理——要么等下次 `rebuild_outputs()`，要么重启常驻服务触发一次。
+
 ## 关键不变量与约束（非显而易见，改动前务必遵守）
 
 - **执行流水不可变 / 不反推：** `allocation_events`（含 `plan_amount`、`deploy_amount`、`executed_at`）和 `fund_execution_log` 是只增交易记录。`executedAmount` **绝不**从持仓市值或涨跌反推。`CurrentValue`/`TargetValue`/`GapValue`/`Gain/Loss` 可随市值更新，但不得覆盖本月执行金额与原始分配。
@@ -114,6 +120,7 @@ load_config() → connect_db() → sync_funds()
 - **缺失不插值：** 美股 PE 缺失月份不插值；美股估值评分仅在 Nasdaq-100 与 S&P 500 样本各 ≥ 20 且 `metric_type` 相同时启用。
 - **缓存与降级：** 市场温度数据缓存 24 小时，更新失败保留最近一次成功数据。
 - **公式版本一致性：** 跨产物的 `formula_version` 必须一致（`model_risk.FORMULA_VERSION` 拼接 A股/NDX/黄金/配置四段）；改模型同时更新版本号。
+- **首次激活护栏：** 模型从影子验证转为 `ACTIVE` 后，`first_activation_guard`/`first_activation_guard_status` 必须能真正拦住第一次正式决策（见上文 NDX 小节），不能只是记录在账本里展示。任何新增的"激活/毕业"类治理状态都要遵循同一模式：状态位必须接到真实闸门上，不能只写不判。
 
 ## 调度（macOS launchd）
 
