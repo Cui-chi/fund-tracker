@@ -78,6 +78,23 @@ def snapshot():
         "allocations": {
             "a_share": 250.54, "us_equity": 424.21, "gold": 0.0,
         },
+        "allocation_routing": {
+            "allocations": {
+                "a_share": 250.54, "us_equity": 424.21, "gold": 0.0,
+            },
+            "assets": {
+                "a_share": {
+                    "positive_gap": 1000.0,
+                    "release_factor": 0.2,
+                    "executable_allocation": 250.54,
+                },
+                "us_equity": {
+                    "positive_gap": 1500.0,
+                    "release_factor": 0.453801,
+                    "executable_allocation": 424.21,
+                },
+            },
+        },
         "dynamic_cash_pool": OPENING_POOL,
         "original_dynamic_cash_pool": OPENING_POOL,
         "fund_carrier_plan": plan,
@@ -170,6 +187,39 @@ class DynamicCashPoolExecutionTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(event["deploy_amount"], 360.54)
         self.assertEqual(event["plan_amount"], PROPOSED_RELEASE)
+
+    def test_execution_freezes_decision_basis_separately_from_actual_amounts(self):
+        result = self.run_execution(a_share=249.0, ndx=424.0)
+        basis = result["execution_decision_snapshot"]
+        self.assertEqual(basis["snapshot_type"], "EXECUTION_DECISION_BASIS")
+        self.assertEqual(basis["routing_status"], "FROZEN_AT_DECISION")
+        self.assertEqual(basis["plan_amount"], PROPOSED_RELEASE)
+        self.assertEqual(
+            basis["allocation_routing"]["allocations"],
+            self.snapshot["allocation_plan"],
+        )
+        self.assertEqual(result["plan_amount"], PROPOSED_RELEASE)
+        self.assertEqual(result["executed_amount"], 673.0)
+        self.assertEqual(result["unexecuted_amount"], 1.75)
+
+    def test_legacy_recalculation_is_not_presented_as_execution_basis(self):
+        self.snapshot["allocation_routing"]["allocations"] = {
+            "a_share": 213.25, "us_equity": 356.12, "gold": 0.0,
+        }
+        self.conn.execute(
+            "UPDATE allocation_history SET snapshot_json = ? WHERE month = ?",
+            (json.dumps(self.snapshot, ensure_ascii=False), "2026-07"),
+        )
+        result = self.run_execution(a_share=249.0, ndx=424.0)
+        basis = result["execution_decision_snapshot"]
+        self.assertEqual(
+            basis["routing_status"],
+            "UNAVAILABLE_LEGACY_EXECUTION_BASIS",
+        )
+        self.assertEqual(
+            basis["allocation_routing"]["allocations"],
+            self.snapshot["allocation_plan"],
+        )
 
     def test_user_reduction_debits_only_confirmed_total(self):
         result = self.run_partial_execution(second=50.0)

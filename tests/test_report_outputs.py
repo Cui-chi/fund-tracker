@@ -1,6 +1,9 @@
+import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import model_risk
 import fund_tracker
@@ -9,6 +12,61 @@ from test_decision_snapshot import decision_payload
 
 
 class ReportOutputTests(unittest.TestCase):
+    def test_executed_dashboard_labels_plan_actual_and_difference_precisely(self):
+        base = Path(model_risk.__file__).resolve().parent
+        report_paths = sorted(
+            (base / "reports" / "runs").glob("*/json/report.json"),
+            reverse=True,
+        )
+        payload = json.loads(report_paths[0].read_text(encoding="utf-8"))
+        copilot = copy.deepcopy(payload["copilot"])
+        copilot.update({
+            "status": "executed",
+            "user_decision": "execute",
+            "allow_auto_execution": True,
+            "dynamic_cash_pool_status": "EXECUTE",
+            "plan_amount": 674.75,
+            "executed_amount": 673.0,
+            "unexecuted_amount": 1.75,
+            "remaining_dynamic_cash_pool": 3702.0,
+            "allocation_plan": {
+                "a_share": 250.54, "us_equity": 424.21, "gold": 0.0,
+            },
+            "executed_allocations": {
+                "a_share": 249.0, "us_equity": 424.0, "gold": 0.0,
+            },
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with mock.patch.object(
+                output_paths,
+                "get_html_snapshot_path",
+                side_effect=lambda name: tmp_path / name,
+            ), mock.patch.object(
+                output_paths,
+                "get_dist_path",
+                side_effect=lambda name: tmp_path / ("dist-" + name),
+            ):
+                fund_tracker.write_copilot_dashboard(
+                    payload["rows"],
+                    payload["macro"],
+                    payload["marketTemperature"],
+                    copilot,
+                    payload.get("allocationHistory", []),
+                    config=fund_tracker.load_config(),
+                )
+            html = (tmp_path / "Asset Allocation Copilot V7.html").read_text(
+                encoding="utf-8"
+            )
+        self.assertIn(
+            "本月原计划 674.75 元 · 实际执行 673.00 元，未执行差额 1.75 元",
+            html,
+        )
+        self.assertIn("原资产层计划 674.75 元", html)
+        self.assertIn("基金层实际执行 673.00 元", html)
+        self.assertIn("未执行差额 1.75 元", html)
+        self.assertIn("本月实际执行: 673.00 元", html)
+
     def test_disabled_a_share_price_model_does_not_gate_hs300_environment(self):
         inputs = fund_tracker.build_data_quality_inputs(
             {}, {}, {"modelEnabled": False}, {}, {}, {}, {}, {},

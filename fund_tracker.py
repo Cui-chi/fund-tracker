@@ -3136,6 +3136,52 @@ def finalized_allocation_snapshot(conn, month):
         }
         executed_at = max(row["executed_at"] for row in fund_executions)
     unexecuted_amount = round(max(0, plan_amount - executed_amount), 2)
+    execution_decision_snapshot = snapshot.get("execution_decision_snapshot")
+    if not isinstance(execution_decision_snapshot, dict):
+        stored_routing = snapshot.get("allocation_routing", {}) or {}
+        routed_allocations = stored_routing.get("allocations", {}) or {}
+        routing_matches_plan = all(
+            abs(
+                float(routed_allocations.get(asset, 0) or 0)
+                - float(allocation_plan.get(asset, 0) or 0)
+            ) <= 0.01
+            for asset in ("a_share", "us_equity", "gold")
+        )
+        if routing_matches_plan:
+            execution_routing = stored_routing
+            routing_status = "FROZEN_AT_DECISION"
+        else:
+            # Older finalized rows may already contain a later recalculation.
+            # Preserve the event amounts without presenting that routing as the
+            # original execution basis.
+            execution_routing = {
+                "status": "UNAVAILABLE_LEGACY_EXECUTION_BASIS",
+                "allocations": allocation_plan,
+                "assets": {},
+            }
+            routing_status = "UNAVAILABLE_LEGACY_EXECUTION_BASIS"
+        execution_decision_snapshot = {
+            "snapshot_type": "EXECUTION_DECISION_BASIS",
+            "generated_at": snapshot.get("generated_at"),
+            "run_id": snapshot.get("run_id"),
+            "formula_version": snapshot.get("formula_version"),
+            "scores": snapshot.get("scores", {}),
+            "targets": snapshot.get("targets", {}),
+            "target_values": snapshot.get("target_values", {}),
+            "current_values": snapshot.get("current_values", {}),
+            "gaps": snapshot.get("gaps", {}),
+            "total_value": snapshot.get("total_value"),
+            "dynamic_cash_pool": snapshot.get("original_dynamic_cash_pool", original_pool),
+            "release_ratio": snapshot.get("release_ratio"),
+            "theoretical_release_amount": snapshot.get("theoretical_release_amount"),
+            "plan_amount": round(plan_amount, 2),
+            "allocation_plan": allocation_plan,
+            "allocation_routing": execution_routing,
+            "routing_status": routing_status,
+            "action_level": snapshot.get("action_level"),
+            "reasons": snapshot.get("reasons", []),
+            "triggers": snapshot.get("triggers", {}),
+        }
     current_month = {
         "status": status,
         "planAmount": round(plan_amount, 2),
@@ -3166,6 +3212,8 @@ def finalized_allocation_snapshot(conn, month):
         "dynamic_cash_pool": round(remaining_pool, 2),
         "deploy_amount": round(plan_amount, 2),
         "allocations": allocation_plan,
+        "allocation_routing": execution_decision_snapshot.get("allocation_routing", {}),
+        "execution_decision_snapshot": execution_decision_snapshot,
         "currentMonth": current_month,
         "current_month": current_month,
     })
@@ -4055,6 +4103,27 @@ def generate_copilot_snapshot(conn, config, market_temperature,
             "matched_rules": matched_rules,
         },
     }
+    snapshot["current_opportunity_assessment"] = {
+        "snapshot_type": "CURRENT_OPPORTUNITY_RECALCULATION",
+        "generated_at": generated_at,
+        "run_id": run_id,
+        "formula_version": snapshot["formula_version"],
+        "scores": scores,
+        "targets": targets,
+        "target_values": target_values,
+        "current_values": current,
+        "gaps": gaps,
+        "total_value": round(total, 2),
+        "dynamic_cash_pool": round(pool, 2),
+        "release_ratio": ratio,
+        "theoretical_release_amount": theoretical_release_amount,
+        "candidate_plan_amount": deploy_amount,
+        "candidate_allocations": allocations,
+        "allocation_routing": allocation_routing,
+        "action_level": action_level,
+        "reasons": reasons,
+        "triggers": snapshot["triggers"],
+    }
     # The canonical decision record is written once, before any legacy
     # finalized fields are overlaid for display compatibility.
     decision_payload = model_risk.create_decision_snapshot_payload(
@@ -4086,6 +4155,8 @@ def generate_copilot_snapshot(conn, config, market_temperature,
             "dynamic_cash_pool",
             "deploy_amount",
             "allocations",
+            "allocation_routing",
+            "execution_decision_snapshot",
             "currentMonth",
             "current_month",
             "release_ratio",
@@ -5708,7 +5779,13 @@ def write_copilot_dashboard(
       </table>
     """ % "".join(approval_rows)
     asset_gate_rows = []
-    routing_assets = copilot.get("allocation_routing", {}).get("assets", {})
+    current_opportunity_assessment = copilot.get(
+        "current_opportunity_assessment", {}
+    ) or {}
+    current_allocation_routing = current_opportunity_assessment.get(
+        "allocation_routing", copilot.get("allocation_routing", {})
+    ) or {}
+    routing_assets = current_allocation_routing.get("assets", {})
     for asset in ("a_share", "us_equity", "gold"):
         quality = copilot.get("asset_level_status", {}).get(asset, {})
         routing = routing_assets.get(asset, {})
@@ -5876,6 +5953,16 @@ def write_copilot_dashboard(
     plan_amount = float(copilot.get("plan_amount", copilot["deploy_amount"]) or 0)
     executed_amount = float(copilot.get("executed_amount", 0) or 0)
     historical_allocations = copilot.get("executed_allocations", {}) or {}
+    execution_decision_snapshot = copilot.get(
+        "execution_decision_snapshot", {}
+    ) or {}
+    decision_allocation_routing = execution_decision_snapshot.get(
+        "allocation_routing", copilot.get("allocation_routing", {})
+    ) or {}
+    decision_routing_assets = decision_allocation_routing.get("assets", {})
+    decision_routing_status = execution_decision_snapshot.get(
+        "routing_status", "FROZEN_AT_DECISION"
+    )
     remaining_pool = float(
         copilot.get("remaining_dynamic_cash_pool", copilot["dynamic_cash_pool"])
         or 0
@@ -5886,7 +5973,7 @@ def write_copilot_dashboard(
         pool_note = "Release Amount: 0 元；历史执行记录仅在 Historical Execution 区块展示"
     elif status == "executed":
         display_amount = executed_amount
-        decision_text = f"本月已执行 {executed_amount:,.0f} 元"
+        decision_text = f"本月已执行 {executed_amount:,.2f} 元"
         pool_note = (
             f"剩余动态资金池 {remaining_pool:,.0f} 元，下月继续判断"
         )
@@ -5901,15 +5988,35 @@ def write_copilot_dashboard(
         decision_text = "等待确认" if plan_amount > 0 else "无需确认"
         pool_note = ""
 
-    display_allocations = (
+    flow_heading = (
+        "本月实际执行" if status == "executed"
+        else "本月原计划（已忽略）" if status == "ignored"
+        else "当前建议资金流"
+    )
+    release_plan_label = "本月原计划" if status == "executed" else "本月资产层计划"
+    release_plan_status = (
+        f"实际执行 {executed_amount:,.2f} 元，未执行差额 "
+        f"{max(0, plan_amount - executed_amount):,.2f} 元"
+        if status == "executed"
+        else "等待执行确认" if status == "pending" and not execution_disabled
+        else "当前不产生执行方案" if execution_disabled
+        else "本月方案已处理"
+    )
+
+    plan_display_allocations = (
         {"a_share": 0, "us_equity": 0, "gold": 0}
         if execution_disabled
         else copilot.get("allocation_plan", copilot["allocations"])
     )
+    display_allocations = (
+        historical_allocations
+        if status == "executed" and not execution_disabled
+        else plan_display_allocations
+    )
     flow_title = "资产层建议"
     flow_rows = []
     for asset in ("a_share", "us_equity", "gold"):
-        amount = float(display_allocations.get(asset, 0) or 0)
+        amount = float(plan_display_allocations.get(asset, 0) or 0)
         if amount > 0:
             flow_rows.append(
                 f"<li><span>{html.escape(asset_label(asset))}</span><strong>{amount:,.0f} 元</strong></li>"
@@ -5921,13 +6028,18 @@ def write_copilot_dashboard(
 
     release_direction_rows = []
     for asset in ("a_share", "us_equity", "gold"):
-        routing = routing_assets.get(asset, {})
-        amount = float(display_allocations.get(asset, 0) or 0)
+        routing = decision_routing_assets.get(asset, {})
+        amount = float(plan_display_allocations.get(asset, 0) or 0)
         release_factor = float(routing.get("release_factor", 1) or 0)
         if execution_disabled:
             direction = "资金池冻结"
         elif amount <= 0:
             direction = "当前无正向执行金额"
+        elif (
+            status == "executed"
+            and decision_routing_status == "UNAVAILABLE_LEGACY_EXECUTION_BASIS"
+        ):
+            direction = "执行时路由明细未保留；历史计划金额以交易流水为准"
         else:
             direction = (
                 f"配置缺口 {float(routing.get('positive_gap', 0) or 0):,.0f} 元"
@@ -5942,9 +6054,9 @@ def write_copilot_dashboard(
         <section class="panel" style="margin-bottom:14px;">
           <span class="eyebrow">Release Allocation Flow</span>
           <h2>本月动态资金释放方向</h2>
-          <p class="muted">本月资产层计划 {display_amount:,.2f} 元 · {'等待执行确认' if status == 'pending' and not execution_disabled else '当前不产生执行方案' if execution_disabled else '本月方案已处理'}</p>
+          <p class="muted">{release_plan_label} {plan_amount:,.2f} 元 · {release_plan_status}</p>
           <table>
-            <thead><tr><th>资产方向</th><th>本月计划</th><th>计算依据</th></tr></thead>
+            <thead><tr><th>资产方向</th><th>{'原计划' if status == 'executed' else '本月计划'}</th><th>计算依据</th></tr></thead>
             <tbody>{''.join(release_direction_rows)}</tbody>
           </table>
           <p class="muted" style="margin-top:10px;">NDX 独立候选承接上限在「配置与资金流」中单列展示；它不等同于本月资产层计划，也不代表已执行金额。</p>
@@ -5967,9 +6079,9 @@ def write_copilot_dashboard(
         <tr>
           <td>{html.escape(row['fund_name'])}<small>{html.escape(row['fund_code'])}</small></td>
           <td>{html.escape(asset_label(row['asset_class']))}</td>
-          <td>{float(row['planned_amount']):,.0f}</td>
+          <td>{float(row['planned_amount']):,.2f}</td>
           <td>{
-              f"{float(row.get('actual_executed_amount', 0)):,.0f}"
+              f"{float(row.get('actual_executed_amount', 0)):,.2f}"
               if status == "executed"
               else "-"
           }</td>
@@ -5989,10 +6101,10 @@ def write_copilot_dashboard(
     if status == "executed":
         execution_summary_html = (
             '<div class="execution-summary">'
-            f"<span>资产层建议 {plan_amount:,.0f} 元</span>"
-            f"<span>基金层实际执行 {executed_amount:,.0f} 元</span>"
-            f"<span>未执行余额 {unexecuted_amount:,.0f} 元</span>"
-            f"<span>剩余资金池 {remaining_pool:,.0f} 元</span>"
+            f"<span>原资产层计划 {plan_amount:,.2f} 元</span>"
+            f"<span>基金层实际执行 {executed_amount:,.2f} 元</span>"
+            f"<span>未执行差额 {unexecuted_amount:,.2f} 元</span>"
+            f"<span>剩余资金池 {remaining_pool:,.2f} 元</span>"
             "</div>"
         )
 
@@ -6264,7 +6376,7 @@ def write_copilot_dashboard(
     flow_tab_content = f"""
     <article class="panel flow-panel">
       <span class="eyebrow">Cash Flow Summary</span>
-      <h2>Current Recommended Flow: {display_amount:,.0f} 元</h2>
+      <h2>{flow_heading}: {display_amount:,.2f} 元</h2>
       <div class="flow-hero">
         <strong class="num">{display_amount:,.0f}</strong><span>元</span>
         <span class="flow-hero-tag">{html.escape(decision_text)}</span>
@@ -6361,6 +6473,8 @@ def write_copilot_dashboard(
           <ul class="rule">{reasons_html}</ul>
           <div class="data-note" style="margin-top:12px;">
             本月方案已执行完毕。动态资金池已相应扣减，剩余资金池将计入下月判断。
+            执行结果按执行时决策快照锁定；当前持仓、Score、Gap 与机会评估仅用于后续判断，
+            不会改写本月原计划或实际执行记录。
           </div>
         </article>
         """
@@ -6437,7 +6551,7 @@ def write_copilot_dashboard(
     # in the 基金回撤 tab. `drawdown_top5` (above) still feeds the focus rollup.
 
     # ── Asset cards for overview ──
-    routing_assets_for_cards = copilot.get("allocation_routing", {}).get("assets", {})
+    routing_assets_for_cards = current_allocation_routing.get("assets", {})
     asset_card_html = ""
     for asset in ("a_share", "gold"):
         score = copilot["scores"].get(asset)
@@ -6963,7 +7077,11 @@ def write_copilot_dashboard(
     else:
         focus_items.append((
             "ok",
-            f"<strong>动态资金池可执行。</strong>本月释放 {display_amount:,.0f} 元。",
+            (
+                f"<strong>本月方案已执行。</strong>实际执行 {display_amount:,.2f} 元。"
+                if status == "executed"
+                else f"<strong>动态资金池可执行。</strong>当前计划 {display_amount:,.2f} 元。"
+            ),
         ))
     focus_items.append((
         "ok", "<strong>固定定投照常执行</strong>，不受资金池冻结影响。",
@@ -7722,8 +7840,8 @@ def write_copilot_dashboard(
             </span>
           </div>
           <div class="dh-headline">
-            <strong class="{('zero' if display_amount == 0 else '')}">{display_amount:,.0f} 元</strong>
-            <span>本月释放 · 固定定投照常执行</span>
+            <strong class="{('zero' if display_amount == 0 else '')}">{display_amount:,.2f} 元</strong>
+            <span>{'本月实际执行' if status == 'executed' else '本月计划'} · 固定定投照常执行</span>
           </div>
           <p class="dh-oneline">{hero_oneline}</p>
           <a class="dh-cta" data-nav-to="data-audit">查看决策与验证详情 →</a>
@@ -7973,8 +8091,9 @@ def write_copilot_dashboard(
               <tr><td>Model Status</td><td style="color:var(--amber);">{html.escape(model_status)}</td></tr>
               <tr><td>Decision Status</td><td>{html.escape(copilot.get('decision_status', 'FREEZE'))}</td></tr>
               <tr><td>Dynamic Cash Pool Status</td><td>{html.escape(pool_model_status)}</td></tr>
-              <tr><td>Current Decision</td><td>{display_amount:,.0f} 元</td></tr>
-              <tr><td>Release Amount</td><td>{0 if execution_disabled else plan_amount:,.0f} 元</td></tr>
+              <tr><td>{'Actual Executed Amount' if status == 'executed' else 'Current Decision'}</td><td>{display_amount:,.2f} 元</td></tr>
+              <tr><td>Original Plan Amount</td><td>{0 if execution_disabled else plan_amount:,.2f} 元</td></tr>
+              <tr><td>Unexecuted Difference</td><td>{unexecuted_amount:,.2f} 元</td></tr>
               <tr><td>Current Release Ratio</td><td>{0 if execution_disabled else copilot['release_ratio'] * 100:.0f}%</td></tr>
               <tr><td>Remaining Dynamic Cash Pool</td><td>{remaining_pool:,.0f} 元</td></tr>
               <tr><td>组合总值</td><td>{copilot['total_value']:,.0f} 元</td></tr>
